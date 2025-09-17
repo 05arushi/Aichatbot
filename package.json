@@ -1,0 +1,26 @@
+{
+  "name": "psqldatabase",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google/genai": "^1.17.0",
+    "@langchain/community": "^0.3.55",
+    "@langchain/core": "^0.3.76",
+    "@langchain/google-genai": "^0.2.17",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "moment": "^2.30.1",
+    "node-nlp": "^5.0.0-alpha.5",
+    "pg": "^8.16.3",
+    "string-similarity-js": "^2.1.4",
+    "typo-js": "^1.3.1"
+  }
+}

@@ -29,11 +29,23 @@ export const initChatPipeline = async () => {
     [
       "system",
       `You are a concise HR assistant. Follow these rules:
-      "You must answer ONLY about the subject asked. Exclude any other names, dates, departments, or records not directly mentioned in the user question. Do not add summaries or extra information."
+      - You must answer ONLY about the subject asked. Exclude any other names, dates, departments, or records not directly mentioned in the user question. Do not add summaries or extra information.
+        + Answer ONLY about the subject asked. 
+        + If the user asks about a **specific person**, show ONLY that person's information.  
+        + If the user asks to **list all users / employees**, show ALL employees with their full details (name, role, department, skills).  
+        + If the user asks for a **summary**, provide a concise 1–2 line summary in addition to the details if relevant.  
 
       FOR "WHO IS" QUESTIONS:
       - Give ONLY: Name is [Role] in [Department] with skills in [Skills]. 
       - Example: "Bob is a Backend Developer in the IT department with skills in Node.js and MongoDB."
+
+      FOR "LIST ALL USERS" QUESTIONS:
+      - Show a table of ALL employees with their full details (name, role, department, skills).
+      - Do not exclude anyone unless a filter (like department) is mentioned.
+
+      FOR SUMMARY QUESTIONS:
+      - Provide a concise 1–2 line summary of the relevant employee(s) or data.
+      - Example: "We have 12 employees across 3 departments, mainly skilled in development and management."
       
       FOR CONTEXTUAL QUESTIONS (like "give his daily report" after asking about someone):
       - Use the chat history to identify who "his/her/their" refers to
@@ -83,7 +95,12 @@ export const initChatPipeline = async () => {
       - If question asks about specific person, show ONLY that person's information
       - Do not include other employees' data
       - If no info found for specific person: "No information found for [Name]"
-      - For greetings: "I'm here and happy to help!"
+      - For greetings: "I’m doing well,ask me any office query I'm here and happy to help!"
+      
+      IF the question is unclear, incomplete, or does not mention any employee or subject I can identify:
+      - Do NOT assume or invent a name
+      - Respond: "I didn’t understand your question. Could you please check your query and ask again?"
+
 
       FORMATTING RULES:
       - Keep all markdown formatting intact (**bold**, bullet points, etc.)
@@ -99,32 +116,48 @@ export const initChatPipeline = async () => {
       context: async (input) => {
         console.log(`Processing question: "${input.question}"`);
         console.log(`Chat history available:`, input.chat_history?.length || 0, 'messages');
-        
+
         let docs = [];
         let searchQuery = input.question;
-        
+
         // Enhanced context resolution: check if question has pronouns and needs context
-        const hasPronouns = /\b(he|his|him|she|her|they|their|them)\b/i.test(input.question);
-        if (hasPronouns && input.chat_history && input.chat_history.length > 0) {
+        const pluralPronouns = /\b(they|them|their)\b/i.test(input.question);
+        const singularPronouns = /\b(he|his|him|she|her)\b/i.test(input.question);
+        console.log(`Pronoun check - Plural: ${pluralPronouns}, Singular: ${singularPronouns}`);
+        if ((pluralPronouns || singularPronouns) && input.chat_history?.length > 0) {
           console.log('Pronoun detected, analyzing chat history for context...');
-          
-          // Look for the most recent person mentioned in chat history
-          const recentMessages = input.chat_history.slice(-4); // Last 4 messages
-          let personMentioned = null;
-          
+
+          const recentMessages = input.chat_history.slice(-4);
+          let personMentioned = [];
+
           for (const message of recentMessages.reverse()) {
             const content = message.content || '';
-            // Look for pattern: "Name is a Role" or "Name's Work Reports"
-            const nameMatch = content.match(/([A-Z][a-z]+ [A-Z][a-z]+)(?:\s+is\s+a|\s+is\s+an|'s\s+Work|'s\s+Leaves)/);
-            if (nameMatch) {
-              personMentioned = nameMatch[1];
-              break;
+            console.log(`Analyzing message: "${content}"`);
+            let regex = /([A-Z][a-z]+ [A-Z][a-z]+)(?:\s+is\s+a|\s+is\s+an|'s\s+Work|'s\s+Leaves|'s\s+Skills)/g;
+            // const regex = /([A-Z][a-z]+ [A-Z][a-z]+)(?:\s+is\s+a|\s+is\s+an|'s\s+Work|'s\s+Leaves)/g;
+            let nameMatch = [...content.matchAll(regex)].map(m => m[1]);
+
+            if (nameMatch.length === 0) {
+              regex = /\b([A-Z][a-z]+ [A-Z][a-z]+)\b/g;
+              nameMatch = [...content.matchAll(regex)].map(m => m[1]);
+            }
+
+            if (nameMatch.length > 0) {
+              console.log(`Names matched:`, nameMatch);
+              personMentioned.push(...nameMatch);
             }
           }
-          
-          if (personMentioned) {
-            console.log(`Context resolved: "${input.question}" refers to ${personMentioned}`);
-            searchQuery = `${input.question} ${personMentioned}`;
+
+          if (personMentioned.length > 0) {
+            const uniquePersons = [...new Set(personMentioned)];
+            if (pluralPronouns) {
+              console.log(`Plural pronoun context -> refers to:`, uniquePersons);
+              searchQuery = `${input.question} ${uniquePersons.join(' ')}`;
+            } else if (singularPronouns) {
+              const latestPerson = uniquePersons[uniquePersons.length - 1];
+              console.log(`Singular pronoun context -> refers to: ${latestPerson}`);
+              searchQuery = `${input.question} ${latestPerson}`;
+            }
           }
         }
 
@@ -179,7 +212,7 @@ export const initChatPipeline = async () => {
   return {
     invoke: async (input) => {
       const { question, sessionId } = input;
-      
+
       if (!sessionId) {
         throw new Error("Session ID is required");
       }
@@ -191,9 +224,18 @@ export const initChatPipeline = async () => {
         { question },
         { configurable: { sessionId } }
       );
-      
+
       console.log(`Raw response: ${response}`);
-      
+
+      const chatHistory = getMessageHistoryForSession(sessionId);
+
+      if (typeof response === "string") {
+        await chatHistory.addAIChatMessage(response);
+      } else if (response?.text) {
+        await chatHistory.addAIChatMessage(response.text);
+      } else {
+        console.warn("Unexpected response format:", response);
+      }
       // Return sanitized response
       return sanitizeResponse(response);
     }

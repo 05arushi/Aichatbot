@@ -3,6 +3,7 @@ import { embeddings } from "./llm.js";
 import pool from "../db.js";
 import { NlpManager } from "node-nlp";
 import moment from 'moment';
+import * as chrono from 'chrono-node';
 
 let retrievers = {};
 const nlpManager = new NlpManager({ languages: ["en"], forceNER: true });
@@ -45,13 +46,19 @@ async function initNLP(employeeNames) {
   nlpManager.addRegexEntity("number", "en", numberRegex);
 
   // Add intent samples that involve the number entity
-  nlpManager.addDocument("en", "show me the last {number} work reports for {employee}", "latestWorkReport");
-  nlpManager.addDocument("en", "give me {number} latest work reports of {employee}", "latestWorkReport");
-  nlpManager.addDocument("en", "show the latest report of {employee}", "latestWorkReport");
-  nlpManager.addDocument("en", "get the last report for {employee}", "latestWorkReport");
+  nlpManager.addDocument("en", "give me {number} latest work reports of {employee}", "WorkReport");
+  nlpManager.addDocument("en", "show the latest report of {employee}", "WorkReport");
+  nlpManager.addDocument("en", "latest report of {employee}", "WorkReport");
+  nlpManager.addDocument("en", "give me last {number} reports of {employee}", "WorkReport");
+  nlpManager.addDocument("en", "get the last entered report for {employee}", "WorkReport");
+  nlpManager.addDocument("en", "yesterday work", "WorkReport");
+  nlpManager.addDocument("en", "work done yesterday", "WorkReport");
+  nlpManager.addDocument("en", "{employee} do yesterday", "WorkReport");
+  nlpManager.addDocument("en", "{employee} working on yesterday", "WorkReport");
+  nlpManager.addDocument("en", "show me {employee}'s report for yesterday", "WorkReport");
 
   // Intent training samples
-  nlpManager.addDocument("en", "names starting with {startLetter}", "filterNamesByLetter");
+  nlpManager.addDocument("en", "list names starting with {startLetter}", "filterNamesByLetter");
   nlpManager.addDocument("en", "list names ending with {endLetter}", "filterNamesByLetter");
   nlpManager.addDocument("en", "names starting with {startLetter} and ending with {endLetter}", "filterNamesByLetter");
   nlpManager.addDocument("en", "show me employees whose names start with {startLetter} and end with {endLetter}", "filterNamesByLetter");
@@ -65,22 +72,15 @@ async function initNLP(employeeNames) {
   nlpManager.addDocument("en", "number of leaves", "leavesCount");
   nlpManager.addDocument("en", "how many leaves", "leavesCount");
 
-  nlpManager.addDocument("en", "yesterday work", "yesterdayWorkReport");
-  nlpManager.addDocument("en", "work done yesterday", "yesterdayWorkReport");
-  nlpManager.addDocument("en", "{employee} do yesterday", "yesterdayWorkReport");
-  nlpManager.addDocument("en", "{employee} working on yesterday", "yesterdayWorkReport");
-  nlpManager.addDocument("en", "show me {employee}'s report for yesterday", "yesterdayWorkReport");
+  nlpManager.addDocument("en", "List all the users", "allusers");
+  nlpManager.addDocument("en", "Show me all users", "allusers");
+  nlpManager.addDocument("en", "Display all users", "allusers");
+  nlpManager.addDocument("en", "list all the employees", "allusers");
 
-  nlpManager.addDocument("en", "hello", "greeting");
-  nlpManager.addDocument("en", "hi", "greeting");
-  nlpManager.addDocument("en", "good morning", "greeting");
-  nlpManager.addDocument("en", "how are you", "greeting");
-  nlpManager.addDocument("en", "how you doing", "greeting");
 
   await nlpManager.train();
   console.log("✅ NLP Manager trained");
 }
-
 
 const getTableColumns = async (client, tableName) => {
   const query = `
@@ -111,7 +111,48 @@ const createCombinedContent = (row, columns) => {
     .join(", ");
 };
 
+function getDateRangeFromQuery(query) {
+  const parsed = chrono.parse(query);
+  const normalized = query.toLowerCase();
+
+  // Detect if query asks for numeric-limited last N reports (e.g., "last 3 reports")
+  const lastNMatch = normalized.match(/\b(last|recent)\s+(\d+)\s+(reports|entries|records|tasks|works)?\b/);
+  if (lastNMatch) {
+    // Number detected → no date filtering for limited last N reports
+    return { startDate: null, endDate: null, wantsAll: false };
+  }
+
+  // Handle natural date ranges or single date (e.g., "last week", "yesterday", "today")
+  if (parsed.length) {
+    if (parsed[0].start && parsed[0].end) {
+      return {
+        startDate: moment(parsed[0].start.date()).format("YYYY-MM-DD"),
+        endDate: moment(parsed[0].end.date()).format("YYYY-MM-DD"),
+        wantsAll: false,
+      };
+    } else if (parsed[0].start) {
+      const dateStr = moment(parsed[0].start.date()).format("YYYY-MM-DD");
+      return { startDate: dateStr, endDate: dateStr, wantsAll: false };
+    }
+  }
+
+  // Handle explicit "all" or "complete" requests
+  if (/\ball\b/.test(normalized) || /\bcomplete\b/.test(normalized) || /\bfull\b/.test(normalized)) {
+    return { startDate: null, endDate: null, wantsAll: true };
+  }
+
+  // Handle "latest" or "recent" keywords - interpret as today's date
+  if (/latest|recent|last entered/.test(normalized)) {
+    const today = moment().format("YYYY-MM-DD");
+    return { startDate: today, endDate: today, wantsAll: false };
+  }
+
+  // Default fallback: no filtering (null dates)
+  return { startDate: null, endDate: null, wantsAll: false };
+}
+
 async function handleIntent(intent, confidence, userName, query, nlpRes) {
+
   if (intent === "employeeCount") {
     const countRes = await pool.query(`SELECT COUNT(*) FROM employees`);
     return [{
@@ -165,22 +206,48 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
     }];
   }
 
-  if (intent === "latestWorkReport" && userName) {
-    // Extract limit dynamically from question text
+  if (intent === "WorkReport" && userName) {
     const numberEntity = nlpRes.entities.find(e => e.entity === "number");
-    let limitCount = numberEntity ? parseInt(numberEntity.option || numberEntity.sourceText) : 1;
-    console.log("Extracted limit count:", limitCount);
+    let limitCount = numberEntity ? parseInt(numberEntity.option || numberEntity.sourceText) : 5;
 
-    const res = await pool.query(
-      `SELECT edr.tasks, edr.date, emp.name
+    const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
+    console.log("Extracted date range:", startDate, endDate, "Wants all:", wantsAll);
+
+    let queryText, queryParams;
+    if(wantsAll){
+      queryText = `
+        SELECT edr.tasks, edr.date, emp.name
         FROM empdailyreports edr
         JOIN employees emp ON emp.id = edr.employee_id
         WHERE emp.name ILIKE $1
         ORDER BY edr.date DESC
-        LIMIT $2
-        `,
-      [userName, limitCount]
-    );
+      `;
+      queryParams = [userName];
+    }else if (startDate && endDate) {
+      queryText = `
+      SELECT edr.tasks, edr.date, emp.name
+      FROM empdailyreports edr
+      JOIN employees emp ON emp.id = edr.employee_id
+      WHERE emp.name ILIKE $1
+      AND edr.date BETWEEN $2 AND $3
+      ORDER BY edr.date DESC
+    `;
+      queryParams = [userName, startDate, endDate];
+    } else {
+      // No date range means latest 'limitCount' reports
+      queryText = `
+      SELECT edr.tasks, edr.date, emp.name
+      FROM empdailyreports edr
+      JOIN employees emp ON emp.id = edr.employee_id
+      WHERE emp.name ILIKE $1
+      ORDER BY edr.date DESC
+      LIMIT $2
+    `;
+      queryParams = [userName, limitCount];
+    }
+
+    const res = await pool.query(queryText, queryParams);
+    console.log("WorkReport query results:", res.rows);
 
     if (res.rows.length === 0) {
       return [{
@@ -188,23 +255,18 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
         metadata: { _table: "empdailyreports" }
       }];
     }
+
     const groupedByDate = {};
     res.rows.forEach(row => {
       const date = moment(row.date).format("YYYY-MM-DD");
       groupedByDate[date] = groupedByDate[date] || [];
-
-      // Use tasks directly; JSONB comes as JS array
       let tasks = Array.isArray(row.tasks) ? row.tasks : [];
-
       tasks.forEach(task => {
-        groupedByDate[date].push(
-          `- ${task.title} (${task.hoursSpent} hours, ${task.status})`
-        );
+        groupedByDate[date].push(`- ${task.title} (${task.hoursSpent} hours, ${task.status})`);
       });
     });
 
-    // Build output content
-    let content = `${userName}'s Latest Work Reports:\n`;
+    let content = `${userName}'s Work Reports:\n`;
     for (const date in groupedByDate) {
       content += `* ${date}:\n` + groupedByDate[date].join("\n") + "\n";
     }
@@ -215,65 +277,55 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
     }];
   }
 
-  if (intent === "leavesCount" && userName) {
-    const countRes = await pool.query(
-      `SELECT COUNT(*) AS leave_count
-       FROM empleaves el
-       JOIN employees emp ON emp.id = el.employee_id
-       WHERE emp.name ILIKE $1;`,
-      [userName]
-    );
-    return [{
-      pageContent: `Total leaves for ${userName}: ${countRes.rows[0].leave_count}`,
-      metadata: { _table: "empleaves" }
-    }];
-  }
-
-  if (intent === "greeting") {
-    return [{
-      pageContent: `I'm here and happy to help!`,
-      metadata: { _table: "none" }
-    }];
-  }
-
-  if (intent === "yesterdayWorkReport" && userName) {
-    const formattedDate = moment().subtract(1, 'days').format('YYYY-MM-DD');
-    const reportRes = await pool.query(
-      `SELECT * FROM empdailyreports edr
-       JOIN employees emp ON emp.id = edr.employee_id
-       WHERE emp.name ILIKE $1 AND edr.date = $2`,
-      [userName, formattedDate]
-    );
-
-    if (reportRes.rows.length === 0) {
+  if (intent === "allusers") {
+    const res = await pool.query(`SELECT name,role,department,skills FROM employees`);
+    if (res.rows.length === 0) {
       return [{
-        pageContent: `No, work report of ${userName} was found of date ${formattedDate}.`,
-        metadata: { _table: "empdailyreports" }
+        pageContent: `No users found in the database.`,
+        metadata: { _table: "employees" }
       }];
     }
+    let table = `| Name | Role | Department | Skills |\n`;
+    table += `|------|------|------------|--------|\n`;
 
-    const groupedByDate = {};
-    reportRes.rows.forEach(row => {
-      groupedByDate[formattedDate] = groupedByDate[formattedDate] || [];
-      groupedByDate[formattedDate].push(`- ${row.task} (${row.hours} hours, ${row.status})`);
+    // Add rows
+    res.rows.forEach(row => {
+      const skills = Array.isArray(row.skills) ? row.skills.join(", ") : row.skills;
+      table += `| ${row.name} | ${row.role} | ${row.department} | ${skills} |\n`;
     });
 
-    let content = `${userName}'s Work Reports:\n`;
-    for (const date in groupedByDate) {
-      content += `* ${date}:\n` + groupedByDate[date].join('\n') + '\n';
-    }
-
     return [{
-      pageContent: content.trim(),
-      metadata: { _table: "empdailyreports" }
+      pageContent: table,
+      metadata: { _table: "employees" }
     }];
   }
+  
+  if (intent === "leavesCount" && userName) {
+  const countRes = await pool.query(
+    `SELECT COUNT(*) AS leave_count
+     FROM empleaves el
+     JOIN employees emp ON emp.id = el.employee_id
+     WHERE emp.name ILIKE $1`,
+    [userName]
+  );
+
+  return [{
+    pageContent: `Total leaves for ${userName}: ${countRes.rows[0].leave_count}`,
+    metadata: { _table: "empleaves" }
+  }];
+}
+
 
   return null;
 }
 
 // Helper: Handle fallback similarity search
-async function handleFallback(baseRetriever, query, table, columns, k) {
+async function handleFallback(baseRetriever, query, table, columns, k, employeeName = null) {
+  // Extract date range and all-flag from query inside fallback
+  const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
+  console.log("Extracted date range:", startDate, endDate, "Wants all:", wantsAll);
+
+  console.log("Performing fallback similarity search...");
   const docs = await baseRetriever.getRelevantDocuments(query, { k });
 
   const enrichedDocs = [];
@@ -281,39 +333,71 @@ async function handleFallback(baseRetriever, query, table, columns, k) {
     try {
       const docId = doc.metadata?.id || doc.id;
       if (docId) {
-        const fullRowQuery = `SELECT * FROM ${table} WHERE id = $1`;
-        const fullRowResult = await pool.query(fullRowQuery, [docId]);
+        const fullRowQuery = `SELECT * FROM ${table} WHERE id = ANY($1::int[])`;
+        const fullRowResult = await pool.query(fullRowQuery, [Array.isArray(docId) ? docId : [docId]]);
 
         if (fullRowResult.rows.length > 0) {
-          const fullRow = fullRowResult.rows[0];
-          const combinedContent = createCombinedContent(fullRow, columns);
+          for (const row of fullRowResult.rows) {
+            // Filter by employee name if provided
+            const nameMatch = !employeeName || (row.name && row.name.toLowerCase() === employeeName.toLowerCase());
 
-          enrichedDocs.push({
-            ...doc,
-            pageContent: combinedContent,
-            metadata: {
-              ...doc.metadata,
-              ...fullRow,
-              _table: table,
-              _columns: columns.map(c => c.name)
+            // Filter by date range if applicable and not wanting all
+            let dateMatch = true;
+            if (!wantsAll && startDate && endDate && row.date) {
+              const rowDate = new Date(row.date);
+              const start = new Date(startDate);
+              const end = new Date(endDate);
+              dateMatch = (rowDate >= start) && (rowDate <= end);
             }
-          });
+
+            if (nameMatch && dateMatch) {
+              const combinedContent = createCombinedContent(row, columns);
+              enrichedDocs.push({
+                ...doc,
+                pageContent: combinedContent,
+                metadata: {
+                  ...doc.metadata,
+                  ...row,
+                  _table: table,
+                  _columns: columns.map(c => c.name)
+                }
+              });
+            }
+          }
         }
       }
     } catch (rowError) {
       console.error(`Error fetching full row data for doc in ${table}:`, rowError);
       enrichedDocs.push({
         ...doc,
-        metadata: {
-          ...doc.metadata,
-          _table: table
-        }
+        metadata: { ...doc.metadata, _table: table }
       });
     }
   }
 
+  if (enrichedDocs.length === 0 && startDate && endDate && !wantsAll) {
+    return [{
+      pageContent: `No reports available for the date range ${startDate} to ${endDate}.`,
+      metadata: { _table: table }
+    }];
+  }
+  if (enrichedDocs.length === 0) {
+    return [{
+      pageContent: "That's beyond my scope. Please reframe your question.",
+      metadata: { _table: "system" }
+    }];
+  }
+
   return enrichedDocs;
 }
+
+// Map intent -> relevant tables
+const intentTableMap = {
+  WorkReport: ["empdailyreports"],
+  leaveDetails: ["empleaves"],
+  employeeInfo: ["employees"],
+};
+
 export const initRetriever = async () => {
   const client = await pool.connect();
   const employeeNames = await getEmployeeNamesFromDB(client);
@@ -329,12 +413,12 @@ export const initRetriever = async () => {
     `);
 
     const tables = res.rows.map(r => r.tablename);
-    console.log("Available tables:", tables);
+    // console.log("Available tables:", tables);
 
     for (const table of tables) {
       try {
         const columns = await getTableColumns(client, table);
-        console.log(`Table ${table} columns:`, columns.map(c => c.name));
+        // console.log(`Table ${table} columns:`, columns.map(c => c.name));
 
         const hasId = columns.some(c => c.name === "id");
         const hasEmbedding = columns.some(c => c.name === "embedding");
@@ -350,10 +434,10 @@ export const initRetriever = async () => {
           )?.name;
         }
         if (!contentColumn) {
-          console.log(`Skipping table ${table}: no suitable content column found`);
+          // console.log(`Skipping table ${table}: no suitable content column found`);
           continue;
         }
-        console.log(`Using content column '${contentColumn}' for table ${table}`);
+        // console.log(`Using content column '${contentColumn}' for table ${table}`);
 
         const vectorStore = await PGVectorStore.initialize(embeddings, {
           pool,
@@ -390,8 +474,10 @@ export const initRetriever = async () => {
               if (isNaN(limitCount) || limitCount <= 0) limitCount = 5;
               console.log("the employee name is:", userName, "from the query:", query, "from table:", table);
 
+
               if (confidence >= 0.9 && intent !== "None") {
                 const intentResponse = await handleIntent(intent, confidence, userName, query, nlpRes);
+                console.log("intenetResponse is:", intentResponse);
                 if (intentResponse) {
                   return intentResponse;
                 }
@@ -399,7 +485,18 @@ export const initRetriever = async () => {
 
 
               // Fallback similarity search
-              const fallbackResponse = await handleFallback(baseRetriever, query, table, columns, limitCount);
+              const allowedTables = intentTableMap[intent] || [table];
+              if (!allowedTables.includes(table)) {
+                return []; // skip irrelevant tables
+              }
+
+              const fallbackResponse = await handleFallback(
+                baseRetriever,
+                query,
+                table,
+                columns,
+                limitCount
+              );
               return fallbackResponse;
 
             } catch (error) {

@@ -50,14 +50,14 @@ const startServer = async () => {
     await new Promise(resolve => setTimeout(resolve, 1000));
     
     //Initialize retrievers 
-    await initRetriever();
-    console.log("All retrievers initialized");
+     initRetriever()
+      .then(() => initChatPipeline())
+      .then(chain => {
+        ragChain = chain;
+        console.log("RAG chain initialized");
+      })
+      .catch(err => console.error("Failed to initialize RAG chain:", err));;
     
-    //Initialize the RAG chain after retrievers are ready
-    ragChain = await initChatPipeline();
-    console.log("RAG chain initialized globally");
-    
-    // 5. Start the server
     app.listen(PORT, () => {
       console.log(` Server running on http://localhost:${PORT}`);
     });

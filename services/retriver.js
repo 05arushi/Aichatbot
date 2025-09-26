@@ -1,3 +1,4 @@
+//retriver.js
 import { PGVectorStore } from "@langchain/community/vectorstores/pgvector";
 import { embeddings } from "./llm.js";
 import pool from "../db.js";
@@ -6,11 +7,20 @@ import moment from 'moment';
 import * as chrono from 'chrono-node';
 
 let retrievers = {};
-const nlpManager = new NlpManager({ languages: ["en"], forceNER: true });
+export const nlpManager = new NlpManager({ languages: ["en"], forceNER: true });
 
 const getEmployeeNamesFromDB = async (client) => {
   const res = await client.query('SELECT name FROM employees');
   return res.rows.map(row => row.name);
+};
+const checkEmployeeExists = async (name) => {
+  const client = await pool.connect();
+  try {
+    const names = await getEmployeeNamesFromDB(client);
+    return names.some(n => n.toLowerCase() === name.toLowerCase());
+  } finally {
+    client.release();
+  }
 };
 
 async function initNLP(employeeNames) {
@@ -214,7 +224,7 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
     console.log("Extracted date range:", startDate, endDate, "Wants all:", wantsAll);
 
     let queryText, queryParams;
-    if(wantsAll){
+    if (wantsAll) {
       queryText = `
         SELECT edr.tasks, edr.date, emp.name
         FROM empdailyreports edr
@@ -223,7 +233,7 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
         ORDER BY edr.date DESC
       `;
       queryParams = [userName];
-    }else if (startDate && endDate) {
+    } else if (startDate && endDate) {
       queryText = `
       SELECT edr.tasks, edr.date, emp.name
       FROM empdailyreports edr
@@ -299,28 +309,67 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
       metadata: { _table: "employees" }
     }];
   }
-  
+
   if (intent === "leavesCount" && userName) {
-  const countRes = await pool.query(
-    `SELECT COUNT(*) AS leave_count
+    const countRes = await pool.query(
+      `SELECT COUNT(*) AS leave_count
      FROM empleaves el
      JOIN employees emp ON emp.id = el.employee_id
      WHERE emp.name ILIKE $1`,
-    [userName]
-  );
+      [userName]
+    );
 
-  return [{
-    pageContent: `Total leaves for ${userName}: ${countRes.rows[0].leave_count}`,
-    metadata: { _table: "empleaves" }
-  }];
-}
+    return [{
+      pageContent: `Total leaves for ${userName}: ${countRes.rows[0].leave_count}`,
+      metadata: { _table: "empleaves" }
+    }];
+  }
 
 
   return null;
 }
 
+function isPronoun(text) {
+  if (!text || typeof text !== "string") return false;
+  const pronouns = ["he", "she", "him", "her", "they", "them", "his", "hers", "their", "theirs"];
+  const words = text.toLowerCase().split(/\s+/);
+  return words.some(word => pronouns.includes(word));
+}
+
+
 // Helper: Handle fallback similarity search
-async function handleFallback(baseRetriever, query, table, columns, k, employeeName = null) {
+async function handleFallback(baseRetriever, query, table, columns, k) {
+  const nlpRes = await nlpManager.process("en", query);
+  const employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
+  const userName = employeeEntity ? (employeeEntity.option || employeeEntity.sourceText) : null;
+
+  // --- Step 1: Pronoun handling ---
+  if (!userName) {
+    if (isPronoun(query)) {
+      console.log("Query contains pronoun, continuing with fallback search...");
+      // move forward with similarity search even without specific employee name
+    } else {
+      console.log("No employee name and no pronoun found in query");
+      return [{
+        pageContent: `I don’t know what "${query}" refers to. Please specify a name.`,
+        metadata: { _table: "employees" }
+      }];
+    }
+  }
+
+  // --- Step 2: Check if employee exists in DB ---
+  if (userName && !isPronoun(userName)) {
+    const exists = await checkEmployeeExists(userName);
+    console.log(userName, "Employee exists:", exists);
+    if (!exists) {
+      return [{
+        pageContent: `User "${userName}" doesn’t exist.`,
+        metadata: { _table: "employees" }
+      }];
+    }
+  }
+
+
   // Extract date range and all-flag from query inside fallback
   const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
   console.log("Extracted date range:", startDate, endDate, "Wants all:", wantsAll);
@@ -339,7 +388,7 @@ async function handleFallback(baseRetriever, query, table, columns, k, employeeN
         if (fullRowResult.rows.length > 0) {
           for (const row of fullRowResult.rows) {
             // Filter by employee name if provided
-            const nameMatch = !employeeName || (row.name && row.name.toLowerCase() === employeeName.toLowerCase());
+            const nameMatch = !userName || (row.name && row.name.toLowerCase() === userName.toLowerCase());
 
             // Filter by date range if applicable and not wanting all
             let dateMatch = true;
@@ -391,13 +440,6 @@ async function handleFallback(baseRetriever, query, table, columns, k, employeeN
   return enrichedDocs;
 }
 
-// Map intent -> relevant tables
-const intentTableMap = {
-  WorkReport: ["empdailyreports"],
-  leaveDetails: ["empleaves"],
-  employeeInfo: ["employees"],
-};
-
 export const initRetriever = async () => {
   const client = await pool.connect();
   const employeeNames = await getEmployeeNamesFromDB(client);
@@ -413,12 +455,10 @@ export const initRetriever = async () => {
     `);
 
     const tables = res.rows.map(r => r.tablename);
-    // console.log("Available tables:", tables);
 
     for (const table of tables) {
       try {
         const columns = await getTableColumns(client, table);
-        // console.log(`Table ${table} columns:`, columns.map(c => c.name));
 
         const hasId = columns.some(c => c.name === "id");
         const hasEmbedding = columns.some(c => c.name === "embedding");
@@ -434,10 +474,8 @@ export const initRetriever = async () => {
           )?.name;
         }
         if (!contentColumn) {
-          // console.log(`Skipping table ${table}: no suitable content column found`);
           continue;
         }
-        // console.log(`Using content column '${contentColumn}' for table ${table}`);
 
         const vectorStore = await PGVectorStore.initialize(embeddings, {
           pool,
@@ -454,59 +492,26 @@ export const initRetriever = async () => {
           search_kwargs: { k: 5 },
         });
 
+        // Retriever's invoke now only does fallback similarity search
         retrievers[table] = {
           invoke: async (query) => {
             try {
-              // Process with NLP.js
-              const nlpRes = await nlpManager.process("en", query);
-              const intent = nlpRes.intent;
-              const confidence = nlpRes.score || 0;
-              console.log("the search intent is:", intent, "and confidence is:", confidence);
-              const employeeEntity = nlpRes.entities.find(
-                e => e.entity === "employee"
-              );
-              const userName = employeeEntity
-                ? employeeEntity.option || employeeEntity.sourceText
-                : null;
-
-              const numberEntity = nlpRes.entities.find(e => e.entity === "number");
-              let limitCount = numberEntity ? parseInt(numberEntity.option || numberEntity.sourceText) : 5;
-              if (isNaN(limitCount) || limitCount <= 0) limitCount = 5;
-              console.log("the employee name is:", userName, "from the query:", query, "from table:", table);
-
-
-              if (confidence >= 0.9 && intent !== "None") {
-                const intentResponse = await handleIntent(intent, confidence, userName, query, nlpRes);
-                console.log("intenetResponse is:", intentResponse);
-                if (intentResponse) {
-                  return intentResponse;
-                }
-              }
-
-
-              // Fallback similarity search
-              const allowedTables = intentTableMap[intent] || [table];
-              if (!allowedTables.includes(table)) {
-                return []; // skip irrelevant tables
-              }
-
               const fallbackResponse = await handleFallback(
                 baseRetriever,
                 query,
                 table,
                 columns,
-                limitCount
+                5
               );
               return fallbackResponse;
-
             } catch (error) {
-              console.error(`Error in custom retriever for ${table}:`, error);
+              console.error(`Error in fallback retriever for table ${table}:`, error);
               throw error;
             }
           }
         };
 
-        console.log(`Custom retriever initialized for table: ${table}`);
+        console.log(`Custom fallback retriever initialized for table: ${table}`);
       } catch (tableError) {
         console.error(`Error initializing retriever for table ${table}:`, tableError);
         continue;
@@ -523,39 +528,64 @@ export const initRetriever = async () => {
   }
 };
 
-export const getRetriever = (tableName) => {
-  if (!retrievers[tableName]) {
-    throw new Error(`Retriever not initialized for ${tableName}`);
-  }
-  return retrievers[tableName];
-};
+// New global intent processing function
+async function processIntentOnce(query) {
+  const nlpRes = await nlpManager.process("en", query);
+  const intent = nlpRes.intent;
+  const confidence = nlpRes.score || 0;
+  console.log("Intent:", intent, "Confidence:", confidence);
 
+  const employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
+  const userName = employeeEntity ? employeeEntity.option || employeeEntity.sourceText : null;
+
+  if (confidence >= 0.9 && intent !== "None") {
+    const intentResponse = await handleIntent(intent, confidence, userName, query, nlpRes);
+    if (intentResponse) return intentResponse;
+  }
+  return null;
+}
+
+// Merged retriever invoke separate, controls intent vs fallback logic
 export const getMergedRetriever = () => {
   if (!Object.keys(retrievers).length) {
     throw new Error("No retrievers initialized yet");
   }
   return {
     invoke: async (query) => {
-      let results = [];
-      for (const [name, retriever] of Object.entries(retrievers)) {
-        try {
-          const docs = await retriever.invoke(query);
-          console.log(`Found ${docs.length} documents in table: ${name}`);
+      //Try intent-based response once per query globally
+      const intentResult = await processIntentOnce(query);
+      if (intentResult) {
+        console.log("Returning intent response, skipping fallback search");
+        return intentResult;
+      }
 
-          results = results.concat(
-            docs.map(d => ({
-              ...d,
-              _source: name,
-            }))
-          );
+      //loop fallback similarity search over all retrievers
+      let results = [];
+      for (const [tableName, retriever] of Object.entries(retrievers)) {
+        try {
+          console.log("query in handlefallback function:", query);
+          const docs = await retriever.invoke(query); // fallback similarity only
+          results = results.concat(docs.map(d => ({ ...d, _source: tableName })));
         } catch (error) {
-          console.error(`Error searching table ${name}:`, error);
+          console.error(`Error during fallback search in table ${tableName}`, error);
         }
       }
-      console.log(`Total documents found: ${results.length}`);
+      console.log(`Total fallback documents found: ${results.length}`);
+      results.sort((a, b) => {
+        // Sort descending by score: higher scores first
+        return (b.score ?? -Infinity) - (a.score ?? -Infinity);
+      });
       return results;
     }
   };
 };
 
+
 export { retrievers };
+
+// export const getRetriever = (tableName) => {
+//   if (!retrievers[tableName]) {
+//     throw new Error(`Retriever not initialized for ${tableName}`);
+//   }
+//   return retrievers[tableName];
+// };

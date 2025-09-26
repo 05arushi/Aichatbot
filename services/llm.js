@@ -2,13 +2,15 @@ import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { GoogleGenerativeAIEmbeddings } from "@langchain/google-genai";
 
 const apiKey = process.env.GEMINI_API_KEY;
+console.log("Using Gemini API Key:", apiKey ? "Provided" : "Not Provided");
 export const llm = new ChatGoogleGenerativeAI({
-  model: "gemini-2.0-flash",
+  model: "gemini-2.5-flash",
   apiKey,
 });
 
 export const embeddings = new GoogleGenerativeAIEmbeddings({
   // model: "models/gemini-embedding-001",
+  // text-embedding-3-small
   model: "text-embedding-004",
   apiKey,
 });

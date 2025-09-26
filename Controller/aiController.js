@@ -1,5 +1,6 @@
 // chatController.js
 import { getRagChain } from "../app.js";
+import { addMessagePair,getAllHistory,getMessagesBySession,deletesession } from "../services/chatDatabase.js";
 
 export const askAI = async (req, res) => {
   try {
@@ -31,6 +32,12 @@ export const askAI = async (req, res) => {
     });
 
     console.log("Generated answer:", answer);
+    try {
+      await addMessagePair(sessionId, question, answer);
+      console.log("Message pair saved successfully");
+    } catch (dbError) {
+      console.error("Failed to save message pair:", dbError);
+    }
     
     res.json({ 
       answer,
@@ -42,6 +49,56 @@ export const askAI = async (req, res) => {
     console.error("LangChain error:", err);
     res.status(500).json({
       error: "Internal Server Error",
+      message: err.message
+    });
+  }
+};
+
+export const getHistory = async (req, res) => {
+  try {
+    const history = await getAllHistory();  
+    res.json({ history });
+  } catch (err) {
+    console.error("Error fetching chat history:", err);
+    res.status(500).json({      
+      error: "Internal Server Error",
+      message: err.message
+    });
+  } 
+};
+
+export const getSessionMessages = async (req, res) => {
+  try {
+    const { sessionId } = req.query;
+    if (!sessionId) {
+      return res.status(400).json({ error: "Session ID is required" });
+    } 
+    const messages = await getMessagesBySession(sessionId);
+    res.json({ sessionId, messages });
+  } catch (err) {
+    console.error("Error fetching session messages:", err);
+    res.status(500).json({
+      error: "Internal Server Error",
+      message: err.message
+    });
+  }
+};
+
+export const deleteSessionMessages = async (req, res) => {
+  try{
+    const {sessionId} = req.query;
+    if(!sessionId){
+      return res.status(400).json({error:"Session ID is required"});
+    }
+    await deletesession(sessionId);
+    res.json({
+      state:true,
+      message:`Session ${sessionId} messages deleted successfully`
+    });
+  }catch(err){
+    console.error("Error deleting session messages:", err);
+    res.status(500).json({
+      state: false,
       message: err.message
     });
   }

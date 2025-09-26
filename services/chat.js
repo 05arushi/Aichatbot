@@ -8,82 +8,84 @@ import { buildCustomContext, sanitizeResponse } from "./contextBuilder.js";
 import { MessagesPlaceholder } from "@langchain/core/prompts";
 import { ChatMessageHistory } from "langchain/stores/message/in_memory";
 import { RunnableWithMessageHistory } from "@langchain/core/runnables";
+import pool from "../db.js";
+import { NodeCache } from '@cacheable/node-cache';
+import { nlpManager } from './retriver.js';
+import { getMessagesBySession } from "./chatDatabase.js";
+import { loadSummarizationChain } from "langchain/chains";
+import { HumanMessage } from "@langchain/core/messages";
+
+const employeeNameCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 
 // Store message histories by session
 const messageHistories = {};
 
-function getMessageHistoryForSession(sessionId) {
-  if (!messageHistories[sessionId]) {
+async function getMessageHistoryForSession(sessionId) {
+  try {
+    const res = await getMessagesBySession(sessionId);
+    if (!messageHistories[sessionId]) {
+      messageHistories[sessionId] = new ChatMessageHistory();
+    }
+    const historyObj = messageHistories[sessionId];
+    if (!res || !res.messages) {
+      return historyObj;
+    }
+    const parsedHistory = typeof res.messages === "string"
+      ? JSON.parse(res.messages)
+      : res.messages;
+    for (const msg of parsedHistory) {
+      if (msg.user) {
+        await historyObj.addUserMessage(msg.user);
+      } else if (msg.assistant) {
+        await historyObj.addAIChatMessage(msg.assistant);
+      }
+    }
+    return historyObj;
+  } catch (error) {
+    console.error("Error retrieving messages for session:", error);
     messageHistories[sessionId] = new ChatMessageHistory();
+    return messageHistories[sessionId];
   }
-  return messageHistories[sessionId];
 }
 
-// Build simplified RAG pipeline that returns an object with invoke method
-export const initChatPipeline = async () => {
-  if (!retrievers || Object.keys(retrievers).length === 0) {
-    throw new Error("No retrievers available. Make sure initRetriever() was called successfully.");
-  }
+async function summarizeChatHistory(messages) {
+  if (!messages || messages.length === 0) return "";
 
-  const prompt = ChatPromptTemplate.fromMessages([
-    [
-      "system",
-      `You are a concise HR assistant. Follow these rules:
-      - You must answer ONLY about the subject asked. Exclude any other names, dates, departments, or records not directly mentioned in the user question. Do not add summaries or extra information.
-        + Answer ONLY about the subject asked. 
-        + If the user asks about a **specific person**, show ONLY that person's information.  
-        + If the user asks to **list all users / employees**, show ALL employees with their full details (name, role, department, skills).  
-        + If the user asks for a **summary**, provide a concise 1–2 line summary in addition to the details if relevant.  
+  const docs = messages.map(m => ({
+    pageContent: m.content,
+    metadata: {}
+  }));
 
-      FOR "WHO IS" QUESTIONS:
-      - Give ONLY: Name is [Role] in [Department] with skills in [Skills]. 
-      - Example: "Bob is a Backend Developer in the IT department with skills in Node.js and MongoDB."
+  // map_reduce is best for long text
 
-      FOR "LIST ALL USERS" QUESTIONS:
-      - Show a table of ALL employees with their full details (name, role, department, skills).
-      - Do not exclude anyone unless a filter (like department) is mentioned.
+  const summarizationChain = loadSummarizationChain(llm, { type: "map_reduce" });
+  const summary = await summarizationChain.invoke({ input_documents: docs });
 
-      FOR SUMMARY QUESTIONS:
-      - Provide a concise 1–2 line summary of the relevant employee(s) or data.
-      - Example: "We have 12 employees across 3 departments, mainly skilled in development and management."
-      
-      FOR CONTEXTUAL QUESTIONS (like "give his daily report" after asking about someone):
+  return summary;
+}
+
+//filter only valid names froom the history
+export const getAllEmployeeNames = async () => {
+  const cached = employeeNameCache.get('employeeNames');
+  if (cached) return cached;
+
+  const res = await pool.query("SELECT name FROM employees");
+  const names = new Set(res.rows.map(r => r.name));
+  employeeNameCache.set('employeeNames', names);
+  return names;
+};
+
+const baseSystemMessage = `You are a concise HR assistant. Follow these core rules:
+- You must answer ONLY about the subject asked.
+- Exclude unrelated names, dates, departments, or records.
+
+FOR CONTEXTUAL QUESTIONS (like "give his daily report" after asking about someone):
       - Use the chat history to identify who "his/her/their" refers to
       - Show the requested information for that person
       - Always include the person's name in the response
       - Example: "Bob's Work Reports:" followed by the reports
-
-      FOR WORK REPORT QUESTIONS:
-      - Focus ONLY on the specific employee (from question or context)
-      - If asking about specific date and no leave found: "No, work report of [Name] was found of date [timeframe]."
-      - Always mention the employee name before listing their reports.
-      - Group leaves by leave type.
-      - Group reports by date.
-      - Use the date as the main bullet point.
-      - Show each task for that date as a sub-bullet.
-      Example:
-      * 2025-09-03:
-        - Setup project repo (3 hours, Completed)
-        - Environment setup (2 hours, Completed)
-
-      FOR LEAVE QUESTIONS:
-      - If asking about specific date and no leave found: "No, [Name] was not on leave [timeframe]."
-      - Always mention the employee name before listing their leaves.
-      - Group leaves by leave type.
-      - Use the leave type as the main bullet point.
-      - Show each leave entry (date, reason, status, etc.) as sub-bullets.
-      Example:
-      * Sick Leave:
-        - 2025-09-02: Fever (Approved)
-        - 2025-09-03: Rest (Pending)
-
-      FOR OTHER QUESTIONS:
-      - Be concise and specific
-      - Only answer what is asked
-      - If the question is a greeting or not about HR, respond warmly and conversationally.
-      - Example: "How are you?" → "I'm here and happy to help!"
-
-      NEVER include:
+      
+ NEVER include:
       - Employee IDs or numbers
       - Personal contact details
       - Salary information
@@ -95,27 +97,117 @@ export const initChatPipeline = async () => {
       - If question asks about specific person, show ONLY that person's information
       - Do not include other employees' data
       - If no info found for specific person: "No information found for [Name]"
-      - For greetings: "I’m doing well,ask me any office query I'm here and happy to help!"
+      - For greetings: "I'm doing well,ask me any office query I'm here and happy to help!"
       
       IF the question is unclear, incomplete, or does not mention any employee or subject I can identify:
       - Do NOT assume or invent a name
-      - Respond: "I didn’t understand your question. Could you please check your query and ask again?"
+      - Respond: "I didn't understand your question. Could you please check your query and ask again?"
 
 
       FORMATTING RULES:
       - Keep all markdown formatting intact (**bold**, bullet points, etc.)
-      - Return formatted data exactly as structured in the context`
-    ],
+      - Return formatted data exactly as structured in the context
+
+`;
+
+const whoIsRules = `
+FOR "WHO IS" QUESTIONS:
+- Give ONLY: Name is [Role] in [Department] with skills in [Skills].
+- Example: "Bob is a Backend Developer in the IT department with skills in Node.js and MongoDB."
+`;
+
+const listAllUsersRules = `
+FOR "LIST ALL USERS" QUESTIONS:
+- Show a table of ALL employees with their full details (name, role, department, skills).
+- Do not exclude anyone unless a filter (like department) is mentioned.
+`;
+
+const summaryRules = `
+FOR SUMMARY QUESTIONS:
+- Provide a concise 3-4 line summary without bullet points.
+- Keep it as a plain paragraph or sentence.
+- Example: "We have 12 employees across 3 departments, mainly skilled in development and management."
+`;
+
+const workReportRules = `
+FOR WORK REPORT QUESTIONS:
+- Focus ONLY on the specific employee.
+  - If asking about specific date and no work found: "No, work report of [Name] was found of date [timeframe]."
+  - Always mention the employee name before listing their reports.
+  - Group reports by date.
+  - Use the date as the main bullet point.
+  - Show each task for that date as a sub-bullet.
+  Example:
+      2025-09-03:
+        - Setup project repo (3 hours, Completed)
+        - Environment setup (2 hours, Completed)
+`;
+
+const leaveQuestionsRules = `
+FOR LEAVE QUESTIONS:
+- If asking about specific date and no leave found: "No, [Name] was not on leave [timeframe]."
+- Always mention the employee name before listing their leaves.
+- Group leaves by leave type.
+- Use the leave type as the main bullet point.
+- Show each leave entry (date, reason, status, etc.) as sub-bullets.
+Example:
+Sick Leave:
+  - 2025-09-02: Fever (Approved)
+  - 2025-09-03: Rest (Pending)
+`;
+
+const otherRules = `
+FOR OTHER QUESTIONS:
+- Be concise and specific.
+- Only answer what is asked
+- For greetings, respond warmly (e.g., "I'm here and happy to help!").
+`;
+
+function getPromptSectionsForIntent(intent) {
+  switch (intent) {
+    case "employeeInfo":
+    case "whoIs":
+      return [baseSystemMessage, whoIsRules];
+    case "allusers":
+      return [baseSystemMessage, listAllUsersRules];
+    case "summary":
+      return [baseSystemMessage, summaryRules];
+    case "WorkReport":
+      return [baseSystemMessage, workReportRules];
+    case "leavesCount":
+      return [baseSystemMessage, leaveQuestionsRules];
+    case "greeting":
+      return [baseSystemMessage, otherRules];
+    default:
+      return [baseSystemMessage];
+  }
+}
+
+async function buildPromptForInput(input) {
+  const nlpRes = await nlpManager.process("en", input.question);
+  const intent = nlpRes.intent || "default";
+
+  const promptSections = getPromptSectionsForIntent(intent);
+  const systemMessage = promptSections.join("\n");
+
+  return ChatPromptTemplate.fromMessages([
+    ["system", systemMessage],
     new MessagesPlaceholder("chat_history"),
     ["human", `Question: {question}\nContext: {context}\n\nProvide a concise answer based on the context.`],
   ]);
+}
+
+// Build simplified RAG pipeline that returns an object with invoke method
+export const initChatPipeline = async () => {
+  if (!retrievers || Object.keys(retrievers).length === 0) {
+    throw new Error("No retrievers available. Make sure initRetriever() was called successfully.");
+  }
 
   const ragChain = RunnableSequence.from([
     {
       question: (input) => input.question,
       context: async (input) => {
         console.log(`Processing question: "${input.question}"`);
-        console.log(`Chat history available:`, input.chat_history?.length || 0, 'messages');
 
         let docs = [];
         let searchQuery = input.question;
@@ -128,7 +220,9 @@ export const initChatPipeline = async () => {
           console.log('Pronoun detected, analyzing chat history for context...');
 
           const recentMessages = input.chat_history.slice(-4);
+          console.log(`Chat history available:`, recentMessages?.length || 0, 'messages');
           let personMentioned = [];
+          const validEmployeeNames = await getAllEmployeeNames();
 
           for (const message of recentMessages.reverse()) {
             const content = message.content || '';
@@ -143,6 +237,7 @@ export const initChatPipeline = async () => {
             }
 
             if (nameMatch.length > 0) {
+              nameMatch = nameMatch.filter(name => validEmployeeNames.has(name));
               console.log(`Names matched:`, nameMatch);
               personMentioned.push(...nameMatch);
             }
@@ -164,7 +259,7 @@ export const initChatPipeline = async () => {
         try {
           // Search across all PostgreSQL tables with enhanced query
           const mergedRetriever = getMergedRetriever();
-          docs = await mergedRetriever.invoke(searchQuery);
+          docs = await mergedRetriever.invoke(searchQuery, { k: 5 });
           console.log(`Found ${docs.length} total documents across all tables`);
         } catch (error) {
           console.error(`Error searching PostgreSQL tables:`, error);
@@ -193,9 +288,38 @@ export const initChatPipeline = async () => {
 
         return context.length > 0 ? context : "No relevant information found.";
       },
-      chat_history: (input) => input.chat_history || [],
+      chat_history: async (input) => {
+        if (!input.chat_history || input.chat_history.length === 0) {
+          return [];
+        }
+
+        const history = input.chat_history;
+        console.log(`Chat history length: ${history.length}`);
+        console.log(`Chat history sample:`, history.slice(-3));
+
+        if (history.length <= 5) {
+          return history;
+        } else {
+          // Summarize all except last message
+          const messagesToSummarize = history.slice(0, -1);
+          const lastMessage = history[history.length - 1];
+          const summary = await summarizeChatHistory(messagesToSummarize);
+          const summaryText = typeof summary === "string"
+            ? summary
+            : summary.text || summary.summary || JSON.stringify(summary);
+          console.log(`Chat history summarized to: "${summaryText}"`);
+
+          return [
+              new HumanMessage({ content: `Summary of previous conversation: ${summaryText}` }),
+            lastMessage,
+          ];
+        }
+      },
     },
-    prompt,
+    async (input) => {
+      const prompt = await buildPromptForInput(input);
+      return prompt;
+    },
     llm,
     new StringOutputParser(),
   ]);
@@ -227,7 +351,7 @@ export const initChatPipeline = async () => {
 
       console.log(`Raw response: ${response}`);
 
-      const chatHistory = getMessageHistoryForSession(sessionId);
+      const chatHistory = await getMessageHistoryForSession(sessionId);
 
       if (typeof response === "string") {
         await chatHistory.addAIChatMessage(response);

@@ -9,7 +9,7 @@ export const buildCustomContext = (docs, question) => {
     'department', 'role', 'position', 'job', 'salary', 'manager', 'team',
     'who is', 'working', 'absent', 'present', 'reports', 'leaves', 'skills',
     'hr', 'human resources', 'personnel', 'workforce', 'about', 'know', 'details', 'report',
-    'daily', 'name', 'names', 'list', 'show', 'give me', 'starting', 'ending'
+    'daily', 'name', 'names', 'list', 'show', 'give me', 'starting', 'ending', 'user', 'users'
   ];
 
   const isHRQuestion = hrKeywords.some(keyword =>
@@ -21,7 +21,8 @@ export const buildCustomContext = (docs, question) => {
     /give\s+me.*name/i,
     /show.*name/i,
     /list.*name/i,
-    /employees?\s+(whose|with|that)/i
+    /employees?\s+(whose|with|that)/i,
+    /users?/i
   ];
 
   const isNameQuery = namePatterns.some(pattern => pattern.test(question));
@@ -56,57 +57,84 @@ export const buildCustomContext = (docs, question) => {
   let contextParts = [];
 
   for (const [source, sourceDocs] of Object.entries(groupedDocs)) {
-    const sourceContext = sourceDocs.map(d => {
-      // Exclude PII and system keys
-      const safeMetadata = { ...d.metadata };
-      delete safeMetadata.phone;
-      delete safeMetadata.aadhaar;
-      delete safeMetadata.pancard;
-      delete safeMetadata.id;
-      delete safeMetadata._table;
-      delete safeMetadata._columns;
-      delete safeMetadata._source;
-
-      // Prioritize important keys
-      const keysPriority = ["name", "employee_name", "role", "title", "department", "skills", "position"];
-      const prioritized = keysPriority
-        .filter(key => safeMetadata[key])
-        .map(key => `${capitalize(key)}: ${safeMetadata[key]}`);
-
-      const otherKeys = Object.keys(safeMetadata)
-        .filter(key => !keysPriority.includes(key) && safeMetadata[key] != null)
-        .map(key => `${capitalize(key)}: ${safeMetadata[key]}`);
-
-      const metadataContent = [...prioritized, ...otherKeys].join(", ");
-
-      // Use page content if available, otherwise use metadata
-      if (d.pageContent && d.pageContent.trim()) {
-        return d.pageContent;
+    if (sourceDocs.length && sourceDocs.every(d => d.pageContent === undefined && typeof d.metadata === "object"))
+      {
+        // Dynamically build rows using all metadata keys except 'id'
+        const rows = sourceDocs.map(d => {
+          const row = {};
+          Object.keys(d.metadata).forEach(k => {
+            if (k.toLowerCase() !== 'id') {
+              row[k] = d.metadata[k];
+            }
+          });
+          return row;
+        });
+        contextParts.push(toMarkdownTable(rows)); // Now generic for all sources
+        continue;
       }
 
-      return metadataContent;
-    }).join("\n");
+      const sourceContext = sourceDocs.map(d => {
+        // Exclude PII and system keys
+        const safeMetadata = { ...d.metadata };
+        delete safeMetadata.phone;
+        delete safeMetadata.aadhaar;
+        delete safeMetadata.pancard;
+        delete safeMetadata.id;
+        delete safeMetadata._table;
+        delete safeMetadata._columns;
+        delete safeMetadata._source;
 
-    if (sourceContext.trim()) {
-      contextParts.push(`From ${source}:\n${sourceContext}`);
+        // Prioritize important keys
+        const keysPriority = ["name", "employee_name", "role", "title", "department", "skills", "position"];
+        const prioritized = keysPriority
+          .filter(key => safeMetadata[key])
+          .map(key => `${capitalize(key)}: ${safeMetadata[key]}`);
+
+        const otherKeys = Object.keys(safeMetadata)
+          .filter(key => !keysPriority.includes(key) && safeMetadata[key] != null)
+          .map(key => `${capitalize(key)}: ${safeMetadata[key]}`);
+
+        const metadataContent = [...prioritized, ...otherKeys].join(", ");
+
+        // Use page content if available, otherwise use metadata
+        if (d.pageContent && d.pageContent.trim()) {
+          return d.pageContent;
+        }
+
+        return metadataContent;
+      }).join("\n");
+
+      if (sourceContext.trim()) {
+        contextParts.push(`From ${source}:\n${sourceContext}`);
+      }
     }
+
+    console.log(`=== Final context length: ${contextParts.join("\n\n").length} ===`);
+    return contextParts.join("\n\n");
+  };
+
+  function toMarkdownTable(rows) {
+    if (!rows.length) return '';
+    const keysRaw = Object.keys(rows[0]).filter(k => k.toLowerCase() !== 'id');
+    const keys = keysRaw.map(capitalize);
+    let header = `| ${keys.join(' | ')} |\n|${keys.map(() => '---').join('|')}|\n`;
+    let body = rows
+      .map(r => `| ${keysRaw.map(k => r[k] ?? '').join(' | ')} |`)
+      .join('\n');
+    return header + body;
   }
 
-  console.log(`=== Final context length: ${contextParts.join("\n\n").length} ===`);
-  return contextParts.join("\n\n");
-};
+  function capitalize(str) {
+    return str.charAt(0).toUpperCase() + str.slice(1);
+  }
 
-function capitalize(str) {
-  return str.charAt(0).toUpperCase() + str.slice(1);
-}
+  export const sanitizeResponse = (response) => {
+    if (!response) return response;
 
-export const sanitizeResponse = (response) => {
-  if (!response) return response;
-
-  return response
-    .replace(/employee\s*id\s*:\s*\w+/gi, '')
-    .replace(/emp\s*id\s*:\s*\w+/gi, '')
-    .replace(/id\s*:\s*\w+/gi, '')
-    .replace(/[ \t]+/g, ' ')
-    .trim();
-};
+    return response
+      .replace(/employee\s*id\s*:\s*\w+/gi, '')
+      .replace(/emp\s*id\s*:\s*\w+/gi, '')
+      .replace(/id\s*:\s*\w+/gi, '')
+      .replace(/[ \t]+/g, ' ')
+      .trim();
+  };

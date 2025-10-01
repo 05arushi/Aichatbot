@@ -81,6 +81,11 @@ async function initNLP(employeeNames) {
   nlpManager.addDocument("en", "total leaves", "leavesCount");
   nlpManager.addDocument("en", "number of leaves", "leavesCount");
   nlpManager.addDocument("en", "how many leaves", "leavesCount");
+  nlpManager.addDocument("en", "was {employee} absent yesterday", "leavesCount");
+  nlpManager.addDocument("en", "was {employee} on leave yesterday", "leavesCount");
+  nlpManager.addDocument("en", "did {employee} take leave yesterday", "leavesCount");
+  nlpManager.addDocument("en", "was he absent yesterday", "leavesCount");
+  nlpManager.addDocument("en", "was she on leave yesterday", "leavesCount");
 
   nlpManager.addDocument("en", "List all the users", "allusers");
   nlpManager.addDocument("en", "Show me all users", "allusers");
@@ -125,43 +130,69 @@ function getDateRangeFromQuery(query) {
   const parsed = chrono.parse(query);
   const normalized = query.toLowerCase();
 
-  // Detect if query asks for numeric-limited last N reports (e.g., "last 3 reports")
-  const lastNMatch = normalized.match(/\b(last|recent)\s+(\d+)\s+(reports|entries|records|tasks|works)?\b/);
-  if (lastNMatch) {
-    // Number detected → no date filtering for limited last N reports
+  // Numeric N-match stays early exit
+  if (/\b(last|recent)\s+(\d+)\s+(reports?|entries?|records?|tasks?|works?)?\b/.test(normalized))
     return { startDate: null, endDate: null, wantsAll: false };
-  }
 
-  // Handle natural date ranges or single date (e.g., "last week", "yesterday", "today")
+  // Mapping of common period phrases to moment operations
+  const periodMap = {
+    "last week": () => [moment().subtract(1, "week").startOf("week"), moment().subtract(1, "week").endOf("week")],
+    "this week": () => [moment().startOf("week"), moment().endOf("week")],
+    "last month": () => [moment().subtract(1, "month").startOf("month"), moment().subtract(1, "month").endOf("month")],
+    "this month": () => [moment().startOf("month"), moment().endOf("month")],
+    "last year": () => [moment().subtract(1, "year").startOf("year"), moment().subtract(1, "year").endOf("year")],
+    "this year": () => [moment().startOf("year"), moment().endOf("year")],
+    "yesterday": () => [moment().subtract(1, "day"), moment().subtract(1, "day")],
+    "today": () => [moment(), moment()],
+  };
+
   if (parsed.length) {
+    const comp = parsed[0].start;
+    const text = parsed[0].text?.toLowerCase() || "";
+
+    // Check mapped periods
+    for (const key in periodMap) {
+      if (text.includes(key)) {
+        const [start, end] = periodMap[key]();
+        return {
+          startDate: start.format("YYYY-MM-DD"),
+          endDate: end.format("YYYY-MM-DD"),
+          wantsAll: false
+        };
+      }
+    }
+
+    // If chrono gives a range
     if (parsed[0].start && parsed[0].end) {
       return {
         startDate: moment(parsed[0].start.date()).format("YYYY-MM-DD"),
         endDate: moment(parsed[0].end.date()).format("YYYY-MM-DD"),
-        wantsAll: false,
+        wantsAll: false
       };
-    } else if (parsed[0].start) {
-      const dateStr = moment(parsed[0].start.date()).format("YYYY-MM-DD");
+    }
+
+    // Default single date if detected
+    if (comp) {
+      const dateStr = moment(comp.date()).format("YYYY-MM-DD");
       return { startDate: dateStr, endDate: dateStr, wantsAll: false };
     }
   }
 
-  // Handle explicit "all" or "complete" requests
-  if (/\ball\b/.test(normalized) || /\bcomplete\b/.test(normalized) || /\bfull\b/.test(normalized)) {
+  // Universal "all/complete/full" case
+  if (/\ball\b|\bcomplete\b|\bfull\b/.test(normalized))
     return { startDate: null, endDate: null, wantsAll: true };
-  }
 
-  // Handle "latest" or "recent" keywords - interpret as today's date
+  // "latest/recent/last entered" as today
   if (/latest|recent|last entered/.test(normalized)) {
     const today = moment().format("YYYY-MM-DD");
     return { startDate: today, endDate: today, wantsAll: false };
   }
 
-  // Default fallback: no filtering (null dates)
+  // Fallback: no filtering
   return { startDate: null, endDate: null, wantsAll: false };
 }
 
-async function handleIntent(intent, confidence, userName, query, nlpRes) {
+async function handleIntent(intent, userName, query, nlpRes) {
 
   if (intent === "employeeCount") {
     const countRes = await pool.query(`SELECT COUNT(*) FROM employees`);
@@ -311,24 +342,88 @@ async function handleIntent(intent, confidence, userName, query, nlpRes) {
   }
 
   if (intent === "leavesCount" && userName) {
-    const countRes = await pool.query(
-      `SELECT COUNT(*) AS leave_count
-     FROM empleaves el
-     JOIN employees emp ON emp.id = el.employee_id
-     WHERE emp.name ILIKE $1`,
-      [userName]
-    );
+    const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
+    console.log("Extracted date range for leavesCount:", startDate, endDate, "Wants all:", wantsAll);
+
+    let queryText, queryParams;
+    if (wantsAll) {
+      queryText = `
+      SELECT el.leave_type, el.start_date,el.end_date,el.reason, el.status,el.number_of_days, emp.name
+      FROM empleaves el
+      JOIN employees emp ON emp.id = el.employee_id
+      WHERE emp.name ILIKE $1
+      ORDER BY el.start_date DESC
+    `;
+      queryParams = [userName];
+    } else if (startDate && endDate) {
+      queryText = `
+        SELECT el.leave_type, el.start_date,el.end_date, el.reason, el.status,el.number_of_days, emp.name
+        FROM empleaves el
+        JOIN employees emp ON emp.id = el.employee_id
+        WHERE emp.name ILIKE $1
+          AND el.start_date <= $3
+          AND el.end_date >= $2
+        ORDER BY el.start_date DESC
+      `;
+      queryParams = [userName, startDate, endDate];
+    } else {
+      queryText = `
+      SELECT el.leave_type, el.start_date,el.end_date, el.reason, el.status,el.number_of_days, emp.name
+      FROM empleaves el
+      JOIN employees emp ON emp.id = el.employee_id
+      WHERE emp.name ILIKE $1
+      ORDER BY el.start_date DESC
+      LIMIT 5
+    `;
+      queryParams = [userName];
+    }
+
+    const res = await pool.query(queryText, queryParams);
+    console.log("LeavesCount query results:", res.rows.length);
+
+    if (res.rows.length === 0) {
+      return [{
+        pageContent: `No leave records found for ${userName}.`,
+        metadata: { _table: "empleaves" }
+      }];
+    }
+    console.log("LeavesCount query results:", res.rows.number_of_days);
+
+    let content = `${userName}'s Leave Details:\n`;
+    res.rows.forEach(row => {
+      content += `- ${moment(row.start_date).format("YYYY-MM-DD")}`;
+      if (row.end_date && row.end_date !== row.start_date) {
+        content += ` to ${moment(row.end_date).format("YYYY-MM-DD")}`;
+        content += ` (${row.number_of_days} days)`;
+      }
+      content += `: ${row.reason} (${row.status})\n`;
+    });
+
+    if (!startDate && !endDate && !wantsAll) {
+      content = "Showing latest 5 leave records. For a specific date range, please provide start and end dates.\n" + content;
+    }
 
     return [{
-      pageContent: `Total leaves for ${userName}: ${countRes.rows[0].leave_count}`,
+      pageContent: content.trim(),
       metadata: { _table: "empleaves" }
     }];
   }
 
-
   return null;
 }
 
+// --- Add this helper near isPronoun ---
+async function resolvePronounToLastEmployee(chatHistory = []) {
+  if (!chatHistory.length) return null;
+
+  for (let i = chatHistory.length - 1; i >= 0; i--) {
+    const msg = chatHistory[i]?.content || '';
+    const nlpRes = await nlpManager.process("en", msg);
+    const employeeEntity = nlpRes.entities?.find(e => e.entity === "employee");
+    if (employeeEntity) return employeeEntity.option || employeeEntity.sourceText;
+  }
+  return null;
+}
 function isPronoun(text) {
   if (!text || typeof text !== "string") return false;
   const pronouns = ["he", "she", "him", "her", "they", "them", "his", "hers", "their", "theirs"];
@@ -336,20 +431,25 @@ function isPronoun(text) {
   return words.some(word => pronouns.includes(word));
 }
 
-
 // Helper: Handle fallback similarity search
-async function handleFallback(baseRetriever, query, table, columns, k) {
+async function handleFallback(baseRetriever, query, table, columns, k = 3, chatHistory = []) {
   const nlpRes = await nlpManager.process("en", query);
-  const employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
-  const userName = employeeEntity ? (employeeEntity.option || employeeEntity.sourceText) : null;
+  let employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
+  let userName = employeeEntity ? (employeeEntity.option || employeeEntity.sourceText) : null;
 
   // --- Step 1: Pronoun handling ---
   if (!userName) {
     if (isPronoun(query)) {
-      console.log("Query contains pronoun, continuing with fallback search...");
-      // move forward with similarity search even without specific employee name
+      console.log("Query contains pronoun → resolving to last mentioned employee...");
+      userName = resolvePronounToLastEmployee(chatHistory);
+
+      if (!userName) {
+        return [{
+          pageContent: `I couldn't resolve who "${query}" refers to. Please mention the employee name.`,
+          metadata: { _table: "employees" }
+        }];
+      }
     } else {
-      console.log("No employee name and no pronoun found in query");
       return [{
         pageContent: `I don’t know what "${query}" refers to. Please specify a name.`,
         metadata: { _table: "employees" }
@@ -360,7 +460,6 @@ async function handleFallback(baseRetriever, query, table, columns, k) {
   // --- Step 2: Check if employee exists in DB ---
   if (userName && !isPronoun(userName)) {
     const exists = await checkEmployeeExists(userName);
-    console.log(userName, "Employee exists:", exists);
     if (!exists) {
       return [{
         pageContent: `User "${userName}" doesn’t exist.`,
@@ -369,15 +468,67 @@ async function handleFallback(baseRetriever, query, table, columns, k) {
     }
   }
 
-
-  // Extract date range and all-flag from query inside fallback
+  // --- Step 3: Extract date range ---
   const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
   console.log("Extracted date range:", startDate, endDate, "Wants all:", wantsAll);
 
+  const enrichedDocs = [];
+
+  // --- Step 4: If no date range, fetch latest 5 entries ---
+  if ((!startDate || !endDate) && !wantsAll) {
+    try {
+      let latestQuery;
+      let params = [];
+
+      if (table === "employees") {
+        latestQuery = `
+            SELECT * FROM employees
+            ${userName ? "WHERE LOWER(name) = LOWER($1)" : ""}
+            ORDER BY date DESC
+            LIMIT 5
+        `;
+        if (userName) params.push(userName);
+      } else {
+        latestQuery = `
+          SELECT t.*, e.name
+          FROM ${table} t
+          JOIN employees e ON t.employee_id = e.id
+          ${userName ? "WHERE LOWER(e.name) = LOWER($1)" : ""}
+          ORDER BY t.date DESC
+          LIMIT 5
+        `;
+        if (userName) params.push(userName);
+      }
+
+      const latestResult = await pool.query(latestQuery, params);
+
+      if (latestResult.rows.length > 0) {
+        for (const row of latestResult.rows) {
+          const combinedContent = createCombinedContent(row, columns);
+          enrichedDocs.push({
+            pageContent: combinedContent,
+            metadata: {
+              ...row,
+              _table: table,
+              _columns: columns.map(c => c.name)
+            }
+          });
+        }
+        // Add message about specifying date range
+        enrichedDocs.unshift({
+          pageContent: "Showing latest 5 records. For a specific date range, please provide start and end dates.",
+          metadata: { _table: table }
+        });
+      }
+    } catch (err) {
+      console.error("Error fetching latest records:", err);
+    }
+  }
+
+  // --- Step 5: Fallback similarity search ---
   console.log("Performing fallback similarity search...");
   const docs = await baseRetriever.getRelevantDocuments(query, { k });
 
-  const enrichedDocs = [];
   for (const doc of docs) {
     try {
       const docId = doc.metadata?.id || doc.id;
@@ -392,11 +543,12 @@ async function handleFallback(baseRetriever, query, table, columns, k) {
 
             // Filter by date range if applicable and not wanting all
             let dateMatch = true;
-            if (!wantsAll && startDate && endDate && row.date) {
-              const rowDate = new Date(row.date);
+            let rowDate = row.date || row.start_date || row.end_date;
+            if (rowDate && startDate && endDate) {
               const start = new Date(startDate);
               const end = new Date(endDate);
-              dateMatch = (rowDate >= start) && (rowDate <= end);
+              rowDate = new Date(rowDate);
+              dateMatch = (rowDate >= start && rowDate <= end);
             }
 
             if (nameMatch && dateMatch) {
@@ -426,10 +578,11 @@ async function handleFallback(baseRetriever, query, table, columns, k) {
 
   if (enrichedDocs.length === 0 && startDate && endDate && !wantsAll) {
     return [{
-      pageContent: `No reports available for the date range ${startDate} to ${endDate}.`,
+      pageContent: `No records available for the date range ${startDate} to ${endDate}.`,
       metadata: { _table: table }
     }];
   }
+
   if (enrichedDocs.length === 0) {
     return [{
       pageContent: "That's beyond my scope. Please reframe your question.",
@@ -494,14 +647,15 @@ export const initRetriever = async () => {
 
         // Retriever's invoke now only does fallback similarity search
         retrievers[table] = {
-          invoke: async (query) => {
+          invoke: async (query, chatHistory = []) => {
             try {
               const fallbackResponse = await handleFallback(
                 baseRetriever,
                 query,
                 table,
                 columns,
-                5
+                5,
+                chatHistory
               );
               return fallbackResponse;
             } catch (error) {
@@ -530,16 +684,17 @@ export const initRetriever = async () => {
 
 // New global intent processing function
 async function processIntentOnce(query) {
+  console.log("Processing intent for query:", query);
   const nlpRes = await nlpManager.process("en", query);
   const intent = nlpRes.intent;
   const confidence = nlpRes.score || 0;
-  console.log("Intent:", intent, "Confidence:", confidence);
-
   const employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
   const userName = employeeEntity ? employeeEntity.option || employeeEntity.sourceText : null;
+  console.log("Extracted employee entity:", userName, "intent", intent, "confidence", confidence);
 
   if (confidence >= 0.9 && intent !== "None") {
-    const intentResponse = await handleIntent(intent, confidence, userName, query, nlpRes);
+    const intentResponse = await handleIntent(intent, userName, query, nlpRes);
+    console.log("Intent response:", intentResponse);
     if (intentResponse) return intentResponse;
   }
   return null;
@@ -582,10 +737,3 @@ export const getMergedRetriever = () => {
 
 
 export { retrievers };
-
-// export const getRetriever = (tableName) => {
-//   if (!retrievers[tableName]) {
-//     throw new Error(`Retriever not initialized for ${tableName}`);
-//   }
-//   return retrievers[tableName];
-// };

@@ -11,6 +11,7 @@ import pool from "../db.js";
 import { NodeCache } from '@cacheable/node-cache';
 import { getMessagesBySession } from "./chatDatabase.js";
 import { traceable } from "langsmith/traceable";
+import { truncateContent } from "./retriver.js";
 
 //CACHE & STORAGE
 const employeeNameCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
@@ -101,15 +102,18 @@ const PROMPTS = {
 
     allusers: `For "List all users": Show everyone in a table, full details. Do not exclude unless filtered.`,
 
-    summary: `For summaries: Give a 3-4 line plain paragraph (no bullets). Example: "We have 12 employees across 3 departments..."`,
+    summary: `For summaries: Give a 3-4 line plain paragraph (no bullets). 
+    Example: "We have 12 employees across 3 departments..."`,
 
-    workReport: `For work reports: Show only the named employee. If none found: "No work report of [Name] was found for [timeframe]." List name before reports and group by date. Example:
+    workReport: `For work reports: Show only the named employee. 
+    If none found: "No work report of [Name] was found for [timeframe]." List name before reports and group by date. Example:
   2025-09-03:
     - Setup project repo (3 hr, Completed)`,
 
-    leaves: `For leave records: If none: "No, [Name] was not on leave [timeframe]." Always mention name before leaves, group by type. Example:
-  Sick Leave:
-    - 2025-09-02: Fever (Approved)`,
+    leaves: `For leave records: If none: "No, [Name] was not on leave [timeframe]." 
+    Always mention name before leaves, group by type. Example:
+    Sick Leave:
+      - 2025-09-02: Fever (Approved)`,
 
     other: `For all else: Be concise and specific. Respond to greetings warmly.`
 };
@@ -144,12 +148,22 @@ const buildPromptForInput = traceable(
 );
 
 // CONTEXT 
-
 const resolveContextFromHistory = traceable(
   async (question, chatHistory) => {
-    const hasPronoun = /\b(he|his|him|she|her|they|them|their)\b/i.test(question);
-    if (!hasPronoun || !chatHistory?.length) return question;
+    if (!chatHistory?.length) return question;
 
+    // Detect pronouns and type
+    const singularPronouns = ["he", "him", "his", "she", "her", "hers"];
+    const pluralPronouns   = ["they", "them", "their", "theirs"];
+
+    const words = question.toLowerCase().split(/\s+/);
+    const pronounType = words.some(w => singularPronouns.includes(w))
+      ? "singular"
+      : words.some(w => pluralPronouns.includes(w))
+      ? "plural"
+      : null;
+
+    if (!pronounType) return question;
     console.log('Pronoun detected, analyzing recent history...');
 
     // Only check last 2 messages for performance
@@ -180,9 +194,14 @@ const resolveContextFromHistory = traceable(
 
     if (foundNames.length > 0) {
       const uniqueNames = [...new Set(foundNames)];
-      const latestName = uniqueNames[uniqueNames.length - 1];
-      console.log(`Resolved pronoun to: ${latestName}`);
-      return `${question} ${latestName}`;
+       if (pronounType === "singular") {
+        const latestName = uniqueNames[uniqueNames.length - 1];
+        console.log(`Resolved singular pronoun to: ${latestName}`);
+        return `${question} ${latestName}`;
+      } else if (pronounType === "plural") {
+        console.log(`Resolved plural pronoun to: ${uniqueNames.join(", ")}`);
+        return `${question} ${uniqueNames.join(", ")}`;
+      }
     }
 
     return question;
@@ -233,7 +252,6 @@ const buildContextStep = traceable(
 );
 
 // SIMPLIFIED HISTORY PROCESSING 
-
 const processHistoryStep = traceable(
   async (input) => {
     if (!input.chat_history?.length) return [];

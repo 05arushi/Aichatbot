@@ -16,7 +16,6 @@ const dateCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
 let retrievers = {};
 export const nlpManager = new NlpManager({ languages: ["en"], forceNER: true });
 
-
 const getEmployeeNamesFromDB = traceable(
   async (client) => {
     const cached = employeeCache.get('employeeNames');
@@ -138,7 +137,7 @@ const getTableColumns = traceable(
       name: row.column_name,
       type: row.data_type,
     }));
-    
+
     employeeCache.set(cacheKey, columns);
     return columns;
   },
@@ -258,7 +257,7 @@ const getNLPResult = traceable(
 
 // INTENT HANDLERS 
 
-const truncateContent = (content, maxLength = 800) => {
+export const truncateContent = (content, maxLength = 800) => {
   if (!content) return "";
   const str = String(content);
   return str.length <= maxLength ? str : str.slice(0, maxLength) + "...";
@@ -266,6 +265,7 @@ const truncateContent = (content, maxLength = 800) => {
 
 const handleIntent = traceable(
   async (intent, userName, query, nlpRes) => {
+    if (!Array.isArray(userName)) userName = userName ? [userName] : [];
     if (intent === "employeeCount") {
       const countRes = await pool.query(`SELECT COUNT(*) FROM employees`);
       return [{
@@ -309,72 +309,135 @@ const handleIntent = traceable(
       }];
     }
 
-    if (intent === "WorkReport" && userName) {
-      const numberEntity = nlpRes.entities.find(e => e.entity === "number");
-      let limitCount = numberEntity ? parseInt(numberEntity.option || numberEntity.sourceText) : 5;
+    if (["WorkReport", "leavesCount"].includes(intent) && userName.length > 0) {
+      const results = [];
 
-      const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
+      for (const username of userName) {
+        const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
+        let queryText, queryParams;
 
-      let queryText, queryParams;
-      if (wantsAll) {
-        queryText = `
-          SELECT edr.tasks, edr.date, emp.name
-          FROM empdailyreports edr
-          JOIN employees emp ON emp.id = edr.employee_id
-          WHERE emp.name ILIKE $1
-          ORDER BY edr.date DESC
-        `;
-        queryParams = [userName];
-      } else if (startDate && endDate) {
-        queryText = `
-          SELECT edr.tasks, edr.date, emp.name
-          FROM empdailyreports edr
-          JOIN employees emp ON emp.id = edr.employee_id
-          WHERE emp.name ILIKE $1 AND edr.date BETWEEN $2 AND $3
-          ORDER BY edr.date DESC
-        `;
-        queryParams = [userName, startDate, endDate];
-      } else {
-        queryText = `
-          SELECT edr.tasks, edr.date, emp.name
-          FROM empdailyreports edr
-          JOIN employees emp ON emp.id = edr.employee_id
-          WHERE emp.name ILIKE $1
-          ORDER BY edr.date DESC
-          LIMIT $2
-        `;
-        queryParams = [userName, limitCount];
+        if (intent === "WorkReport") {
+          const numberEntity = nlpRes.entities.find(e => e.entity === "number");
+          let limitCount = numberEntity ? parseInt(numberEntity.option || numberEntity.sourceText) : 5;
+
+          if (wantsAll) {
+            queryText = `
+              SELECT edr.tasks, edr.date, emp.name
+              FROM empdailyreports edr
+              JOIN employees emp ON emp.id = edr.employee_id
+              WHERE emp.name ILIKE $1
+              ORDER BY edr.date DESC
+            `;
+            queryParams = [username];
+          } else if (startDate && endDate) {
+            queryText = `
+              SELECT edr.tasks, edr.date, emp.name
+              FROM empdailyreports edr
+              JOIN employees emp ON emp.id = edr.employee_id
+              WHERE emp.name ILIKE $1 AND edr.date BETWEEN $2 AND $3
+              ORDER BY edr.date DESC
+            `;
+            queryParams = [username, startDate, endDate];
+          } else {
+            queryText = `
+              SELECT edr.tasks, edr.date, emp.name
+              FROM empdailyreports edr
+              JOIN employees emp ON emp.id = edr.employee_id
+              WHERE emp.name ILIKE $1
+              ORDER BY edr.date DESC
+              LIMIT $2
+            `;
+            queryParams = [username, limitCount];
+          }
+
+          const res = await pool.query(queryText, queryParams);
+          if (res.rows.length === 0) {
+            results.push({
+              pageContent: `No work report of ${username} was found matching the criteria.`,
+              metadata: { _table: "empdailyreports" }
+            });
+            continue;
+          }
+
+          const groupedByDate = {};
+          res.rows.forEach(row => {
+            const date = moment(row.date).format("YYYY-MM-DD");
+            groupedByDate[date] = groupedByDate[date] || [];
+            const tasks = Array.isArray(row.tasks) ? row.tasks : [];
+            tasks.forEach(task => {
+              groupedByDate[date].push(`- ${task.title} (${task.hoursSpent} hours, ${task.status})`);
+            });
+          });
+
+          let content = `${username}'s Work Reports:\n`;
+          for (const date in groupedByDate) {
+            content += `* ${date}:\n` + groupedByDate[date].join("\n") + "\n";
+          }
+
+          results.push({ pageContent: content.trim(), metadata: { _table: "empdailyreports" } });
+        }
+
+        if (intent === "leavesCount") {
+          if (wantsAll) {
+            queryText = `
+              SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
+              FROM empleaves el
+              JOIN employees emp ON emp.id = el.employee_id
+              WHERE emp.name ILIKE $1
+              ORDER BY el.start_date DESC
+            `;
+            queryParams = [username];
+          } else if (startDate && endDate) {
+            queryText = `
+              SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
+              FROM empleaves el
+              JOIN employees emp ON emp.id = el.employee_id
+              WHERE emp.name ILIKE $1 AND el.start_date <= $3 AND el.end_date >= $2
+              ORDER BY el.start_date DESC
+            `;
+            queryParams = [username, startDate, endDate];
+          } else {
+            queryText = `
+              SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
+              FROM empleaves el
+              JOIN employees emp ON emp.id = el.employee_id
+              WHERE emp.name ILIKE $1
+              ORDER BY el.start_date DESC
+              LIMIT 5
+            `;
+            queryParams = [username];
+          }
+
+          const res = await pool.query(queryText, queryParams);
+          if (res.rows.length === 0) {
+            results.push({
+              pageContent: `No leave records found for ${username}.`,
+              metadata: { _table: "empleaves" }
+            });
+            continue;
+          }
+
+          let content = `${username}'s Leave Details:\n`;
+          res.rows.forEach(row => {
+            content += `- ${moment(row.start_date).format("YYYY-MM-DD")}`;
+            if (row.end_date && row.end_date !== row.start_date) {
+              content += ` to ${moment(row.end_date).format("YYYY-MM-DD")}`;
+              content += ` (${row.number_of_days} days)`;
+            }
+            content += `: ${row.reason} (${row.status})\n`;
+          });
+
+          if (!startDate && !endDate && !wantsAll) {
+            content = "Showing latest 5 leave records. For a specific date range, please provide start and end dates.\n" + content;
+          }
+
+          results.push({ pageContent: content.trim(), metadata: { _table: "empleaves" } });
+        }
       }
 
-      const res = await pool.query(queryText, queryParams);
-
-      if (res.rows.length === 0) {
-        return [{
-          pageContent: `No work report of ${userName} was found matching the criteria.`,
-          metadata: { _table: "empdailyreports" }
-        }];
-      }
-
-      const groupedByDate = {};
-      res.rows.forEach(row => {
-        const date = moment(row.date).format("YYYY-MM-DD");
-        groupedByDate[date] = groupedByDate[date] || [];
-        let tasks = Array.isArray(row.tasks) ? row.tasks : [];
-        tasks.forEach(task => {
-          groupedByDate[date].push(`- ${task.title} (${task.hoursSpent} hours, ${task.status})`);
-        });
-      });
-
-      let content = `${userName}'s Work Reports:\n`;
-      for (const date in groupedByDate) {
-        content += `* ${date}:\n` + groupedByDate[date].join("\n") + "\n";
-      }
-
-      return [{
-        pageContent: content.trim(),
-        metadata: { _table: "empdailyreports" }
-      }];
+      return results;
     }
+
 
     if (intent === "allusers") {
       const res = await pool.query(`SELECT name, role, department, skills FROM employees`);
@@ -384,7 +447,7 @@ const handleIntent = traceable(
           metadata: { _table: "employees" }
         }];
       }
-      
+
       let table = `| Name | Role | Department | Skills |\n`;
       table += `|------|------|------------|--------|\n`;
 
@@ -396,69 +459,6 @@ const handleIntent = traceable(
       return [{
         pageContent: table,
         metadata: { _table: "employees" }
-      }];
-    }
-
-    if (intent === "leavesCount" && userName) {
-      const { startDate, endDate, wantsAll } = getDateRangeFromQuery(query);
-
-      let queryText, queryParams;
-      if (wantsAll) {
-        queryText = `
-          SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
-          FROM empleaves el
-          JOIN employees emp ON emp.id = el.employee_id
-          WHERE emp.name ILIKE $1
-          ORDER BY el.start_date DESC
-        `;
-        queryParams = [userName];
-      } else if (startDate && endDate) {
-        queryText = `
-          SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
-          FROM empleaves el
-          JOIN employees emp ON emp.id = el.employee_id
-          WHERE emp.name ILIKE $1 AND el.start_date <= $3 AND el.end_date >= $2
-          ORDER BY el.start_date DESC
-        `;
-        queryParams = [userName, startDate, endDate];
-      } else {
-        queryText = `
-          SELECT el.leave_type, el.start_date, el.end_date, el.reason, el.status, el.number_of_days, emp.name
-          FROM empleaves el
-          JOIN employees emp ON emp.id = el.employee_id
-          WHERE emp.name ILIKE $1
-          ORDER BY el.start_date DESC
-          LIMIT 5
-        `;
-        queryParams = [userName];
-      }
-
-      const res = await pool.query(queryText, queryParams);
-
-      if (res.rows.length === 0) {
-        return [{
-          pageContent: `No leave records found for ${userName}.`,
-          metadata: { _table: "empleaves" }
-        }];
-      }
-
-      let content = `${userName}'s Leave Details:\n`;
-      res.rows.forEach(row => {
-        content += `- ${moment(row.start_date).format("YYYY-MM-DD")}`;
-        if (row.end_date && row.end_date !== row.start_date) {
-          content += ` to ${moment(row.end_date).format("YYYY-MM-DD")}`;
-          content += ` (${row.number_of_days} days)`;
-        }
-        content += `: ${row.reason} (${row.status})\n`;
-      });
-
-      if (!startDate && !endDate && !wantsAll) {
-        content = "Showing latest 5 leave records. For a specific date range, please provide start and end dates.\n" + content;
-      }
-
-      return [{
-        pageContent: content.trim(),
-        metadata: { _table: "empleaves" }
       }];
     }
 
@@ -475,7 +475,7 @@ const resolvePronounToLastEmployee = traceable(
 
     // Only check last 2 messages for performance
     const recentMessages = chatHistory.slice(-2);
-    
+
     for (let i = recentMessages.length - 1; i >= 0; i--) {
       const msg = recentMessages[i]?.content || '';
       const nlpRes = await getNLPResult(msg);
@@ -499,15 +499,15 @@ const isPronoun = (text) => {
 const handleFallback = traceable(
   async (baseRetriever, query, table, columns, k = 3, chatHistory = []) => {
     const nlpRes = await getNLPResult(query);
-    let employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
-    let userName = employeeEntity ? (employeeEntity.option || employeeEntity.sourceText) : null;
+    let employeeEntity = nlpRes.entities.filter(e => e.entity === "employee");
+    let userName = employeeEntity ? employeeEntity.map(e => e.option || e.sourceText) : null;
 
     // Step 1: Pronoun handling
-    if (!userName && isPronoun(query)) {
+    if (userName.length === 0 && isPronoun(query)) {
       console.log("Query contains pronoun → resolving to last mentioned employee...");
       userName = await resolvePronounToLastEmployee(chatHistory);
 
-      if (!userName) {
+      if (userName.length === 0) {
         return [{
           pageContent: `I couldn't resolve who "${query}" refers to. Please mention the employee name.`,
           metadata: { _table: "employees" }
@@ -516,14 +516,18 @@ const handleFallback = traceable(
     }
 
     // Step 2: Validate employee exists
-    if (userName && !isPronoun(userName)) {
-      const exists = await checkEmployeeExists(userName);
-      if (!exists) {
-        return [{
-          pageContent: `User "${userName}" doesn't exist.`,
-          metadata: { _table: "employees" }
-        }];
-      }
+    userName = await Promise.all(userName.map(async name => {
+      if (isPronoun(name)) return null;
+      const exists = await checkEmployeeExists(name);
+      return exists ? name : null;
+    }));
+    userName = userName.filter(Boolean); // remove invalid names
+
+    if (userName.length === 0) {
+      return [{
+        pageContent: `None of the employees you mentioned exist.`,
+        metadata: { _table: "employees" }
+      }];
     }
 
     // Step 3: Get date range
@@ -533,15 +537,16 @@ const handleFallback = traceable(
     const enrichedDocs = [];
 
     // Step 4: Fetch latest records if no date range
-    if ((!startDate || !endDate) && !wantsAll && userName) {
-      try {
-        let latestQuery, params = [];
+    for (const uname of userName) {
+      if ((!startDate || !endDate) && !wantsAll && uname) {
+        try {
+          let latestQuery, params = [];
 
-        if (table === "employees") {
-          latestQuery = `SELECT * FROM employees WHERE LOWER(name) = LOWER($1) LIMIT 5`;
-          params = [userName];
-        } else if (dateCol) {
-          latestQuery = `
+          if (table === "employees") {
+            latestQuery = `SELECT * FROM employees WHERE LOWER(name) = LOWER($1) LIMIT 5`;
+            params = [uname];
+          } else if (dateCol) {
+            latestQuery = `
             SELECT t.*, e.name
             FROM ${table} t
             JOIN employees e ON t.employee_id = e.id
@@ -549,9 +554,9 @@ const handleFallback = traceable(
             ORDER BY t.${dateCol} DESC
             LIMIT 5
           `;
-          params = [userName];
-        } else {
-          latestQuery = `
+            params = [uname];
+          } else {
+            latestQuery = `
             SELECT t.*, e.name
             FROM ${table} t
             JOIN employees e ON t.employee_id = e.id
@@ -559,27 +564,28 @@ const handleFallback = traceable(
             ORDER BY t.id DESC
             LIMIT 5
           `;
-          params = [userName];
-        }
+            params = [uname];
+          }
 
-        const latestResult = await pool.query(latestQuery, params);
+          const latestResult = await pool.query(latestQuery, params);
 
-        if (latestResult.rows.length > 0) {
-          enrichedDocs.push({
-            pageContent: "Showing latest 5 records. For a specific date range, please provide start and end dates.",
-            metadata: { _table: table }
-          });
-
-          latestResult.rows.forEach(row => {
-            const combinedContent = createCombinedContent(row, columns);
+          if (latestResult.rows.length > 0) {
             enrichedDocs.push({
-              pageContent: truncateContent(combinedContent),
-              metadata: { ...row, _table: table, _columns: columns.map(c => c.name) }
+              pageContent: "Showing latest 5 records. For a specific date range, please provide start and end dates.",
+              metadata: { _table: table }
             });
-          });
+
+            latestResult.rows.forEach(row => {
+              const combinedContent = createCombinedContent(row, columns);
+              enrichedDocs.push({
+                pageContent: truncateContent(combinedContent),
+                metadata: { ...row, _table: table, _columns: columns.map(c => c.name) }
+              });
+            });
+          }
+        } catch (err) {
+          console.error("Error fetching latest records:", err);
         }
-      } catch (err) {
-        console.error("Error fetching latest records:", err);
       }
     }
 
@@ -673,7 +679,7 @@ export const initRetriever = traceable(
           if (!hasId || !hasEmbedding) continue;
 
           let contentColumn = columns.find(c => c.name === "name")?.name ||
-                             columns.find(c => ["text", "character varying", "varchar"].includes(c.type))?.name;
+            columns.find(c => ["text", "character varying", "varchar"].includes(c.type))?.name;
 
           if (!contentColumn) continue;
 
@@ -727,8 +733,8 @@ const processIntentOnce = traceable(
     const nlpRes = await getNLPResult(query);
     const intent = nlpRes.intent;
     const confidence = nlpRes.score || 0;
-    const employeeEntity = nlpRes.entities.find(e => e.entity === "employee");
-    const userName = employeeEntity ? employeeEntity.option || employeeEntity.sourceText : null;
+    const employeeEntity = nlpRes.entities.filter(e => e.entity === "employee");
+    const userName = employeeEntity ? employeeEntity.map(e => e.option || e.sourceText) : null;
     console.log("Intent:", intent, "Confidence:", confidence, "Employee:", userName);
 
     if (confidence >= 0.9 && intent !== "None") {
@@ -746,7 +752,7 @@ export const getMergedRetriever = () => {
   if (!Object.keys(retrievers).length) {
     throw new Error("No retrievers initialized yet");
   }
-  
+
   return {
     invoke: traceable(
       async (query) => {
@@ -760,7 +766,7 @@ export const getMergedRetriever = () => {
         // Fallback to similarity search across all tables
         console.log("No intent match, performing similarity search...");
         let results = [];
-        
+
         for (const [tableName, retriever] of Object.entries(retrievers)) {
           try {
             const docs = await retriever.invoke(query);
@@ -769,12 +775,12 @@ export const getMergedRetriever = () => {
             console.error(`Error in table ${tableName}:`, error);
           }
         }
-        
+
         console.log(`Found ${results.length} documents across all tables`);
-        
+
         // Sort by relevance score
         results.sort((a, b) => (b.score ?? -Infinity) - (a.score ?? -Infinity));
-        
+
         return results;
       },
       { name: "MergedRetrieverInvoke", tags: ["retriever", "merged"] }

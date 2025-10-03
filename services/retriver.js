@@ -8,7 +8,7 @@ import * as chrono from 'chrono-node';
 import { traceable } from "langsmith/traceable";
 import { NodeCache } from '@cacheable/node-cache';
 
-// ========== CACHING ==========
+// CACHING 
 const employeeCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 const nlpCache = new NodeCache({ stdTTL: 1800, checkperiod: 120 });
 const dateCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
@@ -16,7 +16,6 @@ const dateCache = new NodeCache({ stdTTL: 600, checkperiod: 60 });
 let retrievers = {};
 export const nlpManager = new NlpManager({ languages: ["en"], forceNER: true });
 
-// ========== CACHED HELPER FUNCTIONS ==========
 
 const getEmployeeNamesFromDB = traceable(
   async (client) => {
@@ -242,7 +241,7 @@ const getDateRangeFromQuery = traceable(
   { name: "GetDateRangeFromQuery", tags: ["date-parsing", "nlp", "cache"] }
 );
 
-// ========== NLP PROCESSING WITH CACHE ==========
+//  NLP PROCESSING WITH CACHE 
 
 const getNLPResult = traceable(
   async (query) => {
@@ -257,7 +256,7 @@ const getNLPResult = traceable(
   { name: "GetNLPResult", tags: ["nlp", "cache"] }
 );
 
-// ========== INTENT HANDLERS ==========
+// INTENT HANDLERS 
 
 const truncateContent = (content, maxLength = 800) => {
   if (!content) return "";
@@ -468,7 +467,7 @@ const handleIntent = traceable(
   { name: "HandleIntent", tags: ["intent", "nlp", "database"] }
 );
 
-// ========== PRONOUN RESOLUTION ==========
+// PRONOUN HANDLING
 
 const resolvePronounToLastEmployee = traceable(
   async (chatHistory = []) => {
@@ -495,7 +494,7 @@ const isPronoun = (text) => {
   return words.some(word => pronouns.includes(word));
 };
 
-// ========== OPTIMIZED FALLBACK HANDLER ==========
+// FALLBACK FUNCTION
 
 const handleFallback = traceable(
   async (baseRetriever, query, table, columns, k = 3, chatHistory = []) => {
@@ -646,7 +645,7 @@ const handleFallback = traceable(
   { name: "HandleFallback", tags: ["fallback", "similarity-search", "retrieval"] }
 );
 
-// ========== RETRIEVER INITIALIZATION ==========
+// RETRIEVER INITIALIZATION 
 
 export const initRetriever = traceable(
   async () => {
@@ -720,7 +719,7 @@ export const initRetriever = traceable(
   { name: "InitRetriever", tags: ["initialization", "retriever"] }
 );
 
-// ========== INTENT PROCESSING ==========
+// INTENT PROCESSING
 
 const processIntentOnce = traceable(
   async (query) => {
@@ -741,7 +740,7 @@ const processIntentOnce = traceable(
   { name: "ProcessIntent", tags: ["intent", "nlp"] }
 );
 
-// ========== MERGED RETRIEVER ==========
+// MERGED RETRIEVER 
 
 export const getMergedRetriever = () => {
   if (!Object.keys(retrievers).length) {

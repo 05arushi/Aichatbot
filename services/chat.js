@@ -12,13 +12,13 @@ import { NodeCache } from '@cacheable/node-cache';
 import { getMessagesBySession } from "./chatDatabase.js";
 import { traceable } from "langsmith/traceable";
 
-// ========== CACHE & STORAGE ==========
+//CACHE & STORAGE
 const employeeNameCache = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 const nlpCache = new NodeCache({ stdTTL: 1800, checkperiod: 120 });
 const HISTORY_WINDOW_SIZE = 4;
 const messageHistories = {};
 
-// ========== CACHED NLP PROCESSING ==========
+//CACHED NLP PROCESSING
 
 const getNLPResult = traceable(
   async (query) => {
@@ -33,7 +33,7 @@ const getNLPResult = traceable(
   { name: "GetNLPResult", tags: ["nlp", "cache"] }
 );
 
-// ========== EMPLOYEE NAMES ==========
+// EMPLOYEE NAMES 
 
 export const getAllEmployeeNames = traceable(
   async () => {
@@ -48,7 +48,7 @@ export const getAllEmployeeNames = traceable(
   { name: "GetAllEmployeeNames", tags: ["cache", "database"] }
 );
 
-// ========== MESSAGE HISTORY ==========
+// MESSAGE HISTORY 
 
 const getMessageHistoryForSession = traceable(
   async (sessionId) => {
@@ -79,40 +79,39 @@ const getMessageHistoryForSession = traceable(
   { name: "GetMessageHistory", tags: ["history", "database"] }
 );
 
-// ========== PROMPTS ==========
 
 const PROMPTS = {
   base: `You are a concise HR assistant. Respond only about what’s asked. Ignore unrelated names, dates, or departments.
 
-For contextual questions ("give his report"), use chat history for pronoun resolution and include the employee’s name (e.g., "Bob's Work Reports: ...").
+      For contextual questions ("give his report"), use chat history for pronoun resolution and include the employee’s name (e.g., "Bob's Work Reports: ...").
 
-Never reveal employee IDs, contacts, salaries, or lengthy explanations.
+      Never reveal employee IDs, contacts, salaries, or lengthy explanations.
 
-Critical rules:
-- For "who is [Name]?": Share only name, role, department, skills.
-- Resolve and mention pronouns.
-- Show only requested individual's info.
-- If info missing: "No information found for [Name]."
-- Greetings: "I'm doing well, ask me any office query!"
-- If unclear: "I didn't understand. Please check your query."
+      Critical rules:
+      - For "who is [Name]?": Share only name, role, department, skills.
+      - Resolve and mention pronouns.
+      - Show only requested individual's info.
+      - If info missing: "No information found for [Name]."
+      - Greetings: "I'm doing well, ask me any office query!"
+      - If unclear: "I didn't understand. Please check your query."
 
-Keep all markdown formatting and structure.`,
+      Keep all markdown formatting and structure.`,
 
-  whoIs: `For "Who is" questions: Only state "Name is [Role] in [Department] with skills in [Skills]." Example: "Bob is a Backend Developer in IT with skills in Node.js."`,
+    whoIs: `For "Who is" questions: Only state "Name is [Role] in [Department] with skills in [Skills]." Example: "Bob is a Backend Developer in IT with skills in Node.js."`,
 
-  allusers: `For "List all users": Show everyone in a table, full details. Do not exclude unless filtered.`,
+    allusers: `For "List all users": Show everyone in a table, full details. Do not exclude unless filtered.`,
 
-  summary: `For summaries: Give a 3-4 line plain paragraph (no bullets). Example: "We have 12 employees across 3 departments..."`,
+    summary: `For summaries: Give a 3-4 line plain paragraph (no bullets). Example: "We have 12 employees across 3 departments..."`,
 
-  workReport: `For work reports: Show only the named employee. If none found: "No work report of [Name] was found for [timeframe]." List name before reports and group by date. Example:
-2025-09-03:
-  - Setup project repo (3 hr, Completed)`,
+    workReport: `For work reports: Show only the named employee. If none found: "No work report of [Name] was found for [timeframe]." List name before reports and group by date. Example:
+  2025-09-03:
+    - Setup project repo (3 hr, Completed)`,
 
-  leaves: `For leave records: If none: "No, [Name] was not on leave [timeframe]." Always mention name before leaves, group by type. Example:
-Sick Leave:
-  - 2025-09-02: Fever (Approved)`,
+    leaves: `For leave records: If none: "No, [Name] was not on leave [timeframe]." Always mention name before leaves, group by type. Example:
+  Sick Leave:
+    - 2025-09-02: Fever (Approved)`,
 
-  other: `For all else: Be concise and specific. Respond to greetings warmly.`
+    other: `For all else: Be concise and specific. Respond to greetings warmly.`
 };
 
 
@@ -144,7 +143,7 @@ const buildPromptForInput = traceable(
   { name: "BuildPrompt", tags: ["prompt", "nlp"] }
 );
 
-// ========== OPTIMIZED CONTEXT RESOLUTION ==========
+// CONTEXT 
 
 const resolveContextFromHistory = traceable(
   async (question, chatHistory) => {
@@ -191,7 +190,7 @@ const resolveContextFromHistory = traceable(
   { name: "ResolveContextFromHistory", tags: ["context", "pronoun-resolution"] }
 );
 
-// ========== CONTEXT BUILDER ==========
+// CONTEXT BUILDER 
 
 const buildContextStep = traceable(
   async (input) => {
@@ -215,7 +214,12 @@ const buildContextStep = traceable(
       for (const [name, retriever] of Object.entries(retrievers)) {
         try {
           const results = await retriever.invoke(searchQuery);
-          docs.push(...results.map(d => ({ ...d, _source: name })));
+          const taggedDocs = results.map(d => ({
+            ...d,
+            _source: name,
+            pageContent: truncateContent(d.pageContent, 300), 
+          }));
+          docs.push(...taggedDocs);
         } catch (err) {
           console.error(`Error in ${name}:`, err);
         }
@@ -228,7 +232,7 @@ const buildContextStep = traceable(
   { name: "ContextStep", tags: ["context", "retrieval"] }
 );
 
-// ========== SIMPLIFIED HISTORY PROCESSING ==========
+// SIMPLIFIED HISTORY PROCESSING 
 
 const processHistoryStep = traceable(
   async (input) => {
@@ -243,7 +247,7 @@ const processHistoryStep = traceable(
   { name: "HistoryProcessingStep", tags: ["history"] }
 );
 
-// ========== CHAT PIPELINE ==========
+// CHAT PIPELINE 
 
 export const initChatPipeline = traceable(
   async () => {

@@ -1,4 +1,5 @@
 {
+  "type": "module",
   "name": "psqldatabase",
   "version": "1.0.0",
   "main": "index.js",
@@ -21,6 +22,7 @@
     "express": "^5.1.0",
     "langchain": "^0.3.34",
     "langsmith": "^0.3.69",
+    "lru-cache": "^7.14.0",
     "moment": "^2.30.1",
     "node-nlp": "^5.0.0-alpha.5",
     "pg": "^8.16.3",

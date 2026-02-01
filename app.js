@@ -1,13 +1,11 @@
 // app.js
-import express from "express";
-import dotenv from "dotenv";
 import 'dotenv/config';
+import express from "express";
 import cors from "cors";
 import pool from "./db.js";
 import { initRetriever } from "./services/retriver.js";
 import { initChatPipeline } from "./services/chat.js";
 import aiRoutes from "./routes/aiRoutes.js";
-dotenv.config();
 
 const app = express();
 app.use(cors());
